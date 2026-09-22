@@ -378,6 +378,7 @@ def parser() -> argparse.ArgumentParser:
     native = commands.add_parser("_hook", add_help=False)
     native.add_argument("--harness", required=True, choices=("codex", "claude-code"))
     native.add_argument("--repo", dest="hook_repo", type=Path)
+    native.add_argument("--repository-hook", action="store_true")
     git_hook = commands.add_parser("_git-hook", add_help=False)
     git_hook.add_argument("event", choices=("post-commit", "post-merge", "post-rewrite"))
     git_hook.add_argument("--repo", dest="hook_repo", type=Path)
@@ -514,6 +515,11 @@ def main(argv: list[str] | None = None) -> int:
             from .automation import handle_hook
 
             payload = _read_hook_payload()
+            if args.repository_hook:
+                from .user_install import user_hook_covers
+
+                if user_hook_covers(args.harness, payload.get("hook_event_name")):
+                    return 0
             payload_cwd = payload.get("cwd")
             selected_hook_repo = (
                 args.hook_repo

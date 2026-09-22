@@ -627,7 +627,7 @@ def _managed_command(
     runtime: RuntimeCommand,
 ) -> str:
     invocation = runtime.cli(
-        ("_hook", "--harness", harness),
+        ("_hook", "--harness", harness, "--repository-hook"),
         bootstrap=repository.bootstrap_path,
     )
     return f"{invocation.shell()} {_MARKER}"
@@ -911,7 +911,8 @@ def _remove_native_hooks(
 
 
 def _config_health(
-    path: Path, command: str, events: tuple[str, ...], harness: str
+    path: Path, command: str, events: tuple[str, ...], harness: str,
+    *, only_event: str | None = None,
 ) -> tuple[bool, str | None]:
     try:
         payload, raw, _mode, _atime, _mtime = _load_json_config(path)
@@ -928,7 +929,7 @@ def _config_health(
     hooks = payload.get("hooks")
     if not isinstance(hooks, dict):
         return False, "Native hook configuration is missing its hooks object."
-    for event in events:
+    for event in (only_event,) if only_event is not None else events:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             return False, f"Managed {event} hook is missing."

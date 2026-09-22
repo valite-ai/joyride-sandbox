@@ -173,6 +173,31 @@ def uninstall_user_hooks() -> dict[str, Any]:
     return status
 
 
+def user_hook_covers(harness: str, event: str | None) -> bool:
+    """Return whether one healthy machine hook owns this event."""
+
+    if event not in _EVENTS.get(harness, ()):
+        return False
+    try:
+        manifest = load_user_manifest()
+        record = _record(manifest, harness)
+        command = record.get("managed_command") if record is not None else None
+        if not isinstance(command, str):
+            return False
+        # A machine hook whose runtime is gone records nothing, so it owns no event.
+        executable, source_root = manifest.get("executable"), manifest.get("source_root")
+        if not isinstance(executable, str) or not os.access(executable, os.X_OK):
+            return False
+        if source_root is not None and not (isinstance(source_root, str) and os.path.isdir(source_root)):
+            return False
+        healthy, _message = _config_health(
+            _config_path(harness), command, _EVENTS[harness], harness, only_event=event
+        )
+        return healthy
+    except (OSError, ValueError):
+        return False
+
+
 def user_hook_health() -> dict[str, dict[str, Any]]:
     """Report each harness's machine-level hook state without changing it."""
 
@@ -228,6 +253,7 @@ __all__ = [
     "install_user_hooks",
     "load_user_manifest",
     "uninstall_user_hooks",
+    "user_hook_covers",
     "user_hook_health",
     "user_install_status",
     "user_manifest_path",
