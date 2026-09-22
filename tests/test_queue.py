@@ -65,6 +65,17 @@ class DeliveryQueueTest(unittest.TestCase):
         clock.now += 19.9
         self.assertIsNone(queue.run_once())
 
+    def test_acme_retry_after_120_is_delivered_after_recovery(self):
+        limited = Outcome(RETRYABLE, 429, retry_after=120.0)
+        queue, client, clock = make_queue(limited, Outcome(DELIVERED, 200))
+        queue.submit("/webhooks/payments", {})
+        queue.run_once()
+        clock.now += 119.9
+        self.assertIsNone(queue.run_once())
+        clock.now += 0.1
+        self.assertEqual(queue.run_once().kind, DELIVERED)
+        self.assertEqual((len(client.calls), queue.dead_letters), (2, []))
+
     def test_permanent_outcome_is_dead_lettered(self):
         queue, _, _ = make_queue(Outcome(PERMANENT, 404))
         queue.submit("u", {})
