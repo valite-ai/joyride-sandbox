@@ -173,6 +173,23 @@ def uninstall_user_hooks() -> dict[str, Any]:
     return status
 
 
+def _runtime_problem(manifest: dict[str, Any]) -> str | None:
+    """Name the missing runtime that the managed hook command starts, if any."""
+
+    executable, source_root = manifest.get("executable"), manifest.get("source_root")
+    if not isinstance(executable, str) or not os.access(executable, os.X_OK):
+        return (
+            f"The Joyride runtime in the machine hook command is missing: {executable}. "
+            "Run joyride install --user again."
+        )
+    if source_root is not None and not (isinstance(source_root, str) and os.path.isdir(source_root)):
+        return (
+            f"The Joyride source in the machine hook command is missing: {source_root}. "
+            "Run joyride install --user again."
+        )
+    return None
+
+
 def user_hook_covers(harness: str, event: str | None) -> bool:
     """Return whether one healthy machine hook owns this event."""
 
@@ -185,10 +202,7 @@ def user_hook_covers(harness: str, event: str | None) -> bool:
         if not isinstance(command, str):
             return False
         # A machine hook whose runtime is gone records nothing, so it owns no event.
-        executable, source_root = manifest.get("executable"), manifest.get("source_root")
-        if not isinstance(executable, str) or not os.access(executable, os.X_OK):
-            return False
-        if source_root is not None and not (isinstance(source_root, str) and os.path.isdir(source_root)):
+        if _runtime_problem(manifest) is not None:
             return False
         healthy, _message = _config_health(
             _config_path(harness), command, _EVENTS[harness], harness, only_event=event
@@ -227,6 +241,9 @@ def user_hook_health() -> dict[str, dict[str, Any]]:
         healthy, message = _config_health(
             _config_path(harness), command, _EVENTS[harness], harness
         )
+        runtime_problem = _runtime_problem(manifest)
+        if healthy and runtime_problem is not None:
+            healthy, message = False, runtime_problem
         health[harness] = {
             "installed": healthy,
             "state": "enabled" if healthy else "needs-attention",

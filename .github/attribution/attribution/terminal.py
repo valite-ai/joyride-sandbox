@@ -1730,12 +1730,16 @@ def render_status(
     _append_field(lines, "Repository", repository_path, output_width)
     user_scope = _mapping(status.get("user_scope"))
     if user_scope:
-        _append_field(
-            lines,
-            "Machine hooks",
-            "enabled" if user_scope.get("installed") is True else "not installed",
-            output_width,
-        )
+        machine_hooks = "enabled" if user_scope.get("installed") is True else "not installed"
+        for harness in _mapping(user_scope.get("harnesses")).values():
+            harness = _mapping(harness)
+            if harness.get("state") == "needs-attention":
+                machine_hooks = "needs attention"
+                message = safe_text(harness.get("message"))
+                if message:
+                    machine_hooks += f" - {message}"
+                break
+        _append_field(lines, "Machine hooks", machine_hooks, output_width)
     if status.get("git_repository") is False:
         lines.extend(_warning_lines(status.get("warnings"), width=output_width))
         return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"
@@ -1940,6 +1944,39 @@ def render_user_setup(
     else:
         _append_wrapped(lines, "Existing attribution data was preserved.", output_width)
     lines.extend(_warning_lines(data.get("warnings"), width=output_width))
+    return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"
+
+
+def render_self_test(
+    result: Mapping[str, Any], *, width: int | None = None, color: bool | None = None,
+) -> str:
+    """Render one pass or fail verdict for each harness of the self-test."""
+
+    data = _mapping(result)
+    output_width = _width(width)
+    use_color = _color_enabled(color)
+    passed = data.get("passed") is True
+    heading = "Self-test passed" if passed else "Self-test failed"
+    lines = [_style(heading, _BOLD + (_GREEN if passed else _RED), use_color)]
+    for item in _items(data.get("harnesses")):
+        harness = _mapping(item)
+        verdict = "pass" if harness.get("passed") is True else "fail"
+        scopes = [safe_text(scope) for scope in _items(harness.get("scopes"))]
+        reason = safe_text(harness.get("reason"))
+        value = f"{verdict} ({' and '.join(scopes)} hooks)" if scopes else verdict
+        if reason:
+            value += f" - {reason}"
+        _append_field(lines, safe_text(harness.get("name")) or "Harness", value, output_width)
+        if harness.get("commit_line"):
+            _append_field(
+                lines, "Commit line", safe_text(harness["commit_line"]), output_width, indent="  "
+            )
+    if any(_items(_mapping(item).get("scopes")) for item in _items(data.get("harnesses"))):
+        _append_wrapped(
+            lines,
+            "The test used a temporary repository and removed it afterward.",
+            output_width,
+        )
     return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"
 
 

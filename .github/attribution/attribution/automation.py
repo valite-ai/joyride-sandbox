@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -2090,24 +2091,190 @@ def handle_git_hook(repo: RepoPath, event: str = "post-commit") -> dict[str, obj
                     event == "post-commit"
                     and not _latest_head_action_is_direct_commit(root)
                 )
+                imported = 0
                 if history_import:
-                    connection.execute(
+                    imported = connection.execute(
                         """
                         UPDATE hook_captures SET status = 'imported'
                         WHERE worktree_id = ? AND status = 'pending'
                         """,
                         (worktree_id,),
-                    )
+                    ).rowcount
                 connection.commit()
                 if _active_count(connection, worktree_id):
-                    return _result("pending")
+                    outcome = _result("pending")
+                    outcome["summary"] = [_pending_summary(commit_sha, imported)]
+                    return outcome
             finally:
                 connection.close()
         recorded, warnings = _drain_pending(root, worktree_id)
         status = "captured" if recorded else ("warning" if warnings else "ignored")
-        return _result(status, recorded_commits=recorded, warnings=warnings)
+        outcome = _result(status, recorded_commits=recorded, warnings=warnings)
+        if commit_sha in recorded:
+            try:
+                outcome["summary"] = _commit_summary(root, worktree_id, commit_sha)
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError):
+                # The note is already written; only its one-line proof is lost.
+                pass
+        return outcome
     except Exception as exc:
         return _result("warning", warnings=[_warning(exc)])
+
+
+# Completed captures that kept their edits unattributed, and why.
+_UNATTRIBUTED_CAPTURES = {
+    "completed_limited": "over the snapshot size limit",
+    "completed_contaminated": "overlapping another tool call",
+    "completed_imported": "from rewritten or merged history",
+}
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return singular if count == 1 else plural
+
+
+def _pending_summary(commit_sha: str, imported: int) -> str:
+    short = commit_sha[:12]
+    if imported:
+        return (
+            f"Joyride: {imported} running agent tool "
+            f"{_plural(imported, 'call was', 'calls were')} kept unattributed "
+            f"because {short} came from rewritten or merged history."
+        )
+    return f"Joyride: the note for {short} is written when the current agent tool call ends."
+
+
+def _agent_label(session: Mapping[str, Any]) -> str:
+    from .harnesses import harness_display_name
+    from .terminal import safe_text
+
+    harness = session.get("harness_id") or session.get("harness")
+    try:
+        name = harness_display_name(harness)
+    except ValueError:
+        name = str(harness or "unknown agent")
+    model = session.get("model")
+    return safe_text(f"{name} ({model})" if model else name)
+
+
+# The post-commit summary reads HEAD's reflog from its newest entry, so a short
+# scan finds the commit it just made without reading a long history.
+_REFLOG_SCAN_LIMIT = 1000
+
+
+def _base_arrival(root: Path, commit_sha: str, parent: str | None) -> str | None:
+    """Return when HEAD reached the base of ``commit_sha``, from HEAD's reflog.
+
+    That time is the reflog entry just before the commit's own entry. A root
+    commit with no earlier entry starts a new history, so its captures all
+    count. ``None`` means that the reflog cannot say.
+    """
+
+    result = subprocess.run(
+        [
+            "git", "-C", str(root), "reflog", "show", f"--max-count={_REFLOG_SCAN_LIMIT}",
+            "--date=unix", "--format=%H %gd", "HEAD",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=system_subprocess_environment(),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    entries = [line.split(" ", 1) for line in result.stdout.decode("utf-8", errors="replace").splitlines()]
+    index = next((position for position, entry in enumerate(entries) if entry[0] == commit_sha), None)
+    if index is None:
+        return None
+    if index + 1 == len(entries):
+        return "" if parent is None else None
+    selector = entries[index + 1][-1]
+    if not (selector.startswith("HEAD@{") and selector.endswith("}") and selector[6:-1].isdigit()):
+        return None
+    moment = datetime.fromtimestamp(int(selector[6:-1]), timezone.utc)
+    return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _commit_summary(root: Path, worktree_id: str, commit_sha: str) -> list[str]:
+    """Return at most two lines that prove what the commit's note recorded."""
+
+    statuses = ",".join("?" for _ in _UNATTRIBUTED_CAPTURES)
+    connection = open_db(root)
+    try:
+        row = connection.execute(
+            "SELECT note_json FROM recorded_commits WHERE commit_sha = ?",
+            (commit_sha,),
+        ).fetchone()
+        skipped_rows = []
+        if connection.execute(
+            f"SELECT 1 FROM hook_captures WHERE worktree_id = ? AND status IN ({statuses}) LIMIT 1",
+            (worktree_id, *_UNATTRIBUTED_CAPTURES),
+        ).fetchone() is not None:
+            from .notes import _first_parent
+
+            parent = _first_parent(root, commit_sha)
+            # A capture from an earlier visit to the same base, for example on
+            # another branch, belongs to that history and not to this commit.
+            arrival = _base_arrival(root, commit_sha, parent)
+            if arrival is not None:
+                skipped_rows = connection.execute(
+                    f"""
+                    SELECT status, COUNT(*) AS count
+                    FROM hook_captures
+                    WHERE worktree_id = ?
+                      AND base_commit IS ?
+                      AND started_at >= ?
+                      AND status IN ({statuses})
+                    GROUP BY status
+                    """,
+                    (worktree_id, parent, arrival, *_UNATTRIBUTED_CAPTURES),
+                ).fetchall()
+    finally:
+        connection.close()
+    short = commit_sha[:12]
+    lines: list[str] = []
+    note = json.loads(row["note_json"]) if row is not None else {}
+    sessions = {
+        session["id"]: session
+        for session in note.get("sessions", [])
+        if isinstance(session, dict) and isinstance(session.get("id"), str)
+    }
+    added = 0
+    by_agent: dict[str, int] = {}
+    for file_record in note.get("files", []):
+        added += int(file_record.get("added_lines", 0))
+        for line_range in file_record.get("ranges", []):
+            label = _agent_label(sessions.get(line_range.get("session_id"), {}))
+            by_agent[label] = by_agent.get(label, 0) + line_range["end"] - line_range["start"] + 1
+    attributed = sum(by_agent.values())
+    if attributed:
+        ordered = sorted(by_agent.items(), key=lambda item: (-item[1], item[0]))
+        agents = (
+            f" to {ordered[0][0]}"
+            if len(ordered) == 1
+            else ": " + ", ".join(f"{label} {count}" for label, count in ordered)
+        )
+        lines.append(
+            f"Joyride: {attributed} of {added} added "
+            f"{_plural(added, 'line', 'lines')} in {short} "
+            f"{_plural(attributed, 'is', 'are')} attributed{agents}."
+        )
+    if skipped_rows:
+        counts: dict[str, int] = {}
+        for skipped in skipped_rows:
+            reason = _UNATTRIBUTED_CAPTURES[skipped["status"]]
+            counts[reason] = counts.get(reason, 0) + int(skipped["count"])
+        total = sum(counts.values())
+        if total:
+            details = ", ".join(
+                f"{count} {reason}" for reason, count in sorted(counts.items())
+            )
+            lines.append(
+                f"Joyride: {total} agent tool {_plural(total, 'call', 'calls')} "
+                f"before {short} {_plural(total, 'was', 'were')} not attributed "
+                f"({details})."
+            )
+    return lines
 
 
 def automation_status(repo: RepoPath) -> dict[str, object]:

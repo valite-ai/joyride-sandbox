@@ -1231,11 +1231,14 @@ exit 0
         return text.encode("utf-8")
 
     runtime_command = runtime.cli((), bootstrap=bootstrap).shell()
+    # Only the one-line commit summary, written to descriptor 3, may reach the
+    # terminal. Every other byte of hook output stays silent.
     action = (
         f'{_CURRENT_WORKTREE_ONLY_ENV}=1 {runtime_command} '
-        'install --repo "$_attribution_repo"'
+        'install --repo "$_attribution_repo" >/dev/null 2>&1'
         if hook_name == "post-checkout"
-        else f'{runtime_command} --repo "$_attribution_repo" _git-hook {hook_name}'
+        else f'{runtime_command} --repo "$_attribution_repo" _git-hook {hook_name} '
+        "--summary-fd 3 3>&2 >/dev/null 2>&1"
     )
     text = f'''#!/bin/sh
 {_MARKER}
@@ -1251,7 +1254,7 @@ if [ -x "$_attribution_original" ]; then
 fi
 _attribution_repo=$(git rev-parse --show-toplevel 2>/dev/null) || _attribution_repo=
 if [ -n "$_attribution_repo" ]; then
-  {action} >/dev/null 2>&1 || :
+  {action} || :
 fi
 exit "$_attribution_status"
 '''

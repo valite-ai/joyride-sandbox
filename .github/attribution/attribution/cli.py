@@ -16,7 +16,7 @@ from . import __version__
 
 _HOOK_INPUT_LIMIT = 2 * 1024 * 1024
 _PUBLIC_COMMANDS = (
-    "{install,uninstall,report,show,serve,code,why,status,run,task,session,hook,"
+    "{install,uninstall,report,show,serve,code,why,status,self-test,run,task,session,hook,"
     "recover,harnesses,hook-template,record,hosted,doctor,demo,help}"
 )
 
@@ -239,6 +239,12 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", help="Print the raw status JSON")
     _repo_option(status)
 
+    self_test = commands.add_parser(
+        "self-test", help="Run the installed hooks against a temporary repository"
+    )
+    self_test.add_argument("--json", action="store_true", help="Print the raw result JSON")
+    _repo_option(self_test)
+
     doctor = commands.add_parser(
         "doctor", help="Check hosted GitHub and local installation readiness"
     )
@@ -390,6 +396,7 @@ def parser() -> argparse.ArgumentParser:
     git_hook = commands.add_parser("_git-hook", add_help=False)
     git_hook.add_argument("event", choices=("post-commit", "post-merge", "post-rewrite"))
     git_hook.add_argument("--repo", dest="hook_repo", type=Path)
+    git_hook.add_argument("--summary-fd", type=int)
     collector = commands.add_parser("_collector", add_help=False)
     collector.add_argument("collector_command", choices=("_serve",))
     collector.add_argument("--state-dir", required=True)
@@ -564,7 +571,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "_git-hook":
             from .automation import handle_git_hook
 
-            handle_git_hook(_selected_repo(args), args.event)
+            result = handle_git_hook(_selected_repo(args), args.event)
+            summary = result.get("summary")
+            if args.summary_fd is not None and summary:
+                # The Git hook proxy hands over its stderr as this descriptor,
+                # so only these lines reach the terminal.
+                try:
+                    os.write(args.summary_fd, "".join(f"{line}\n" for line in summary).encode("utf-8"))
+                except OSError:
+                    pass
             return 0
         if args.action == "_share":
             from .sharing import main as share
@@ -936,6 +951,18 @@ def main(argv: list[str] | None = None) -> int:
 
                 _emit(render_status(installation, automation))
             return 0
+
+        if args.action == "self-test":
+            from .self_test import run_self_test
+
+            result = run_self_test(_selected_repo(args))
+            if args.json:
+                _emit_json(result)
+            else:
+                from .terminal import render_self_test
+
+                _emit(render_self_test(result))
+            return 0 if result["passed"] else 1
 
         if args.action == "doctor":
             from .hosted import doctor
