@@ -14,7 +14,7 @@ launcher, so the command text that a tool may have reviewed stays the same.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import fcntl
 import functools
 import hashlib
@@ -226,6 +226,44 @@ def load_user_manifest() -> dict[str, Any] | None:
     return manifest
 
 
+# Agent folders that the machine install can create. ``~/.attribution`` keeps
+# the machine lock file after an uninstall, so it is never removed: a writer
+# that waited on the lock must share its file with every later writer.
+_AGENT_DIRS = (".codex", ".claude")
+
+
+def _created_dirs(previous: dict[str, Any] | None) -> list[str]:
+    """Return the home folders that this install creates.
+
+    A reinstall keeps the list that the first install recorded. A manifest from
+    an earlier release has no list, so its folders are never removed.
+    """
+
+    if previous is not None:
+        recorded = previous.get("created_dirs")
+        return [str(item) for item in recorded] if isinstance(recorded, list) else []
+    home = _home()
+    return [name for name in _AGENT_DIRS if not os.path.lexists(home / name)]
+
+
+def _remove_created_dirs(created: Any) -> None:
+    """Remove the launcher folder and the agent folders the install created.
+
+    Each goes only when it is empty. A folder that existed before the install,
+    or that holds other files, stays.
+    """
+
+    home = _home()
+    with suppress(OSError):
+        launcher_path().parent.rmdir()
+    names = [str(item) for item in created] if isinstance(created, list) else []
+    for name in _AGENT_DIRS:
+        path = home / name
+        if name in names and path.is_dir() and not path.is_symlink():
+            with suppress(OSError):
+                path.rmdir()
+
+
 def _telemetry_owner(previous: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a manifest that owns machine cost collection and no hooks yet."""
 
@@ -325,20 +363,39 @@ def _codex_trust(
     hooks_path = _config_path("codex")
     config_path = hooks_path.parent / "config.toml"
     previous = previous if isinstance(previous, dict) else {}
-    owned = previous.get("block") if isinstance(previous.get("block"), str) else None
     created = (
         previous.get("created_file") is True
         if "created_file" in previous
         else not config_path.exists()
     )
     entries = trust_entries(hooks_path, payload, _managed_command("codex"))
-    block, message = apply_trust(config_path, hooks_path, entries, owned)
-    return {
+    owned, message = apply_trust(config_path, hooks_path, entries, _trust_owned(previous))
+    record: dict[str, Any] = {
         "config_path": str(config_path),
-        "block": block,
+        "block": None,
         "created_file": created,
         "message": message,
     }
+    if isinstance(owned, dict):
+        record["block"] = owned.get("block")
+        record["entries"] = owned.get("entries", {})
+    elif isinstance(owned, str):
+        record["block"] = owned
+    return record
+
+
+def _trust_owned(record: Any) -> Any:
+    """Return what a trust record owns, in the form ``apply_trust`` reads.
+
+    A record from an earlier release holds only the block text.
+    """
+
+    if not isinstance(record, dict):
+        return None
+    block = record.get("block") if isinstance(record.get("block"), str) else None
+    if isinstance(record.get("entries"), dict):
+        return {"block": block, "entries": record["entries"]}
+    return block
 
 
 def _codex_warning(codex: Any) -> str | None:
@@ -359,6 +416,7 @@ def install_user_hooks() -> dict[str, Any]:
     runtime = _runtime()
     previous = load_user_manifest()
     home = _home()
+    created_dirs = _created_dirs(previous)
     executable = _stable_executable(runtime)
     launcher = launcher_path()
     _assert_native_target(launcher, home)
@@ -403,9 +461,9 @@ def install_user_hooks() -> dict[str, Any]:
             # Record ownership before the collector starts or Codex changes,
             # so an install that fails later still leaves an uninstall that
             # can undo them.
-            _write(
-                user_manifest_path(), _json_bytes(_telemetry_owner(previous)), mode=0o600
-            )
+            owner = _telemetry_owner(previous)
+            owner.setdefault("created_dirs", created_dirs)
+            _write(user_manifest_path(), _json_bytes(owner), mode=0o600)
             registered = True
         try:
             setup = telemetry_setup.configure_telemetry(machine_telemetry_id())
@@ -434,6 +492,7 @@ def install_user_hooks() -> dict[str, Any]:
         "launcher_sha256": _sha256(launcher_bytes),
         "telemetry_enabled": telemetry_enabled,
         "telemetry_registered": registered,
+        "created_dirs": created_dirs,
         "integrations": {},
     }
     # Carry the Git and trust ownership of an earlier install through every
@@ -537,7 +596,8 @@ def uninstall_user_hooks() -> dict[str, Any]:
         # out can delete a configuration file that Joyride created.
         warning = remove_trust(
             Path(trust["config_path"]),
-            trust.get("block") if isinstance(trust.get("block"), str) else None,
+            _trust_owned(trust),
+            hooks_path=_config_path("codex"),
             delete_empty=trust.get("created_file") is True,
         )
         if warning:
@@ -599,6 +659,7 @@ def uninstall_user_hooks() -> dict[str, Any]:
         _write(user_manifest_path(), _json_bytes(_telemetry_owner()), mode=0o600)
     else:
         user_manifest_path().unlink(missing_ok=True)
+        _remove_created_dirs(manifest.get("created_dirs"))
     status = user_install_status()
     status["warnings"] = warnings
     return status

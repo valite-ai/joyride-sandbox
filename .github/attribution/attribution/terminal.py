@@ -388,9 +388,10 @@ def _pad(text: str, limit: int, *, right: bool = False) -> str:
     return padding + clipped if right else clipped + padding
 
 
-def _wrap(text: Any, limit: int) -> list[str]:
+def _wrap(text: Any, limit: int, *, full: bool = False) -> list[str]:
     clean = safe_text(text) or "unknown"
-    clean = _clip(clean, max(80, limit * 4))
+    if not full:
+        clean = _clip(clean, max(80, limit * 4))
     if limit <= 1:
         return [_clip(clean, max(1, limit))]
     lines: list[str] = []
@@ -419,28 +420,36 @@ def _wrap(text: Any, limit: int) -> list[str]:
     return lines or ["unknown"]
 
 
-def _append_wrapped(lines: list[str], value: Any, width: int, *, indent: str = "") -> None:
+def _append_wrapped(
+    lines: list[str], value: Any, width: int, *, indent: str = "", full: bool = False
+) -> None:
     available = max(1, width - _display_width(indent))
-    lines.extend(indent + item for item in _wrap(value, available))
+    lines.extend(indent + item for item in _wrap(value, available, full=full))
 
 
 def _append_hanging(
-    lines: list[str], value: Any, width: int, *, first: str, continuation: str
+    lines: list[str], value: Any, width: int, *, first: str, continuation: str,
+    full: bool = False,
 ) -> None:
     available = max(1, width - max(_display_width(first), _display_width(continuation)))
-    wrapped = _wrap(value, available)
+    wrapped = _wrap(value, available, full=full)
     lines.append(first + wrapped[0])
     lines.extend(continuation + item for item in wrapped[1:])
 
 
-def _append_field(lines: list[str], label: str, value: Any, width: int, *, indent: str = "") -> None:
+def _append_field(
+    lines: list[str], label: str, value: Any, width: int, *, indent: str = "",
+    full: bool = False,
+) -> None:
+    """Add one labeled field. ``full`` wraps a long setup message instead of cutting it."""
+
     prefix = f"{indent}{label}: "
     available = width - _display_width(prefix)
     if available < 10:
         lines.append(_clip(prefix.rstrip(), width))
-        _append_wrapped(lines, value, width, indent=indent + "  ")
+        _append_wrapped(lines, value, width, indent=indent + "  ", full=full)
         return
-    wrapped = _wrap(value, available)
+    wrapped = _wrap(value, available, full=full)
     lines.append(prefix + wrapped[0])
     continuation = " " * _display_width(prefix)
     lines.extend(continuation + item for item in wrapped[1:])
@@ -900,7 +909,7 @@ def _more_information(report: Mapping[str, Any], width: int) -> list[str]:
     return lines
 
 
-def _warning_lines(*values: Any, width: int) -> list[str]:
+def _warning_lines(*values: Any, width: int, full: bool = False) -> list[str]:
     warnings: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -929,7 +938,7 @@ def _warning_lines(*values: Any, width: int) -> list[str]:
         return []
     lines = ["", "Warnings"]
     for warning in warnings[:10]:
-        _append_hanging(lines, warning, width, first="- ", continuation="  ")
+        _append_hanging(lines, warning, width, first="- ", continuation="  ", full=full)
     if len(warnings) > 10:
         lines.append(f"- ... {len(warnings) - 10:,} more warnings")
     return lines
@@ -1739,7 +1748,7 @@ def render_status(
                 if message:
                     machine_hooks += f" - {message}"
                 break
-        _append_field(lines, "Machine hooks", machine_hooks, output_width)
+        _append_field(lines, "Machine hooks", machine_hooks, output_width, full=True)
     if status.get("git_repository") is False:
         lines.extend(_warning_lines(status.get("warnings"), width=output_width))
         return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"
@@ -1932,7 +1941,7 @@ def render_user_setup(
         message = safe_text(harness.get("message"))
         if message and harness.get("state") == "needs-attention":
             harness_state += f" - {message}"
-        _append_field(lines, label, harness_state, output_width)
+        _append_field(lines, label, harness_state, output_width, full=True)
     telemetry = _mapping(data.get("telemetry"))
     if installed and telemetry:
         costs = [
@@ -1953,9 +1962,9 @@ def render_user_setup(
         message = safe_text(git_hooks.get("message"))
         if message and git_hooks.get("state") == "needs-attention":
             git_state += f" - {message}"
-        _append_field(lines, "Git hooks", git_state, output_width)
+        _append_field(lines, "Git hooks", git_state, output_width, full=True)
     if installed and isinstance(data.get("notice"), str) and data["notice"]:
-        _append_field(lines, "Notice", data["notice"], output_width)
+        _append_field(lines, "Notice", data["notice"], output_width, full=True)
     sessions = [
         _mapping(item) for item in _items(data.get("restart_sessions"))
     ]
@@ -1971,6 +1980,7 @@ def render_user_setup(
             + ", ".join(named)
             + ". Work done before a restart is not captured.",
             output_width,
+            full=True,
         )
     if installed:
         _append_wrapped(
@@ -1980,7 +1990,7 @@ def render_user_setup(
         )
     else:
         _append_wrapped(lines, "Existing attribution data was preserved.", output_width)
-    lines.extend(_warning_lines(data.get("warnings"), width=output_width))
+    lines.extend(_warning_lines(data.get("warnings"), width=output_width, full=True))
     return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"
 
 

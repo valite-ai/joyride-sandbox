@@ -2289,6 +2289,49 @@ def _install_worktree(
     return installation_status(repository.root)
 
 
+def _enrollable(
+    machine: dict[str, Any] | None, repository: Any, manifest: dict[str, Any] | None
+) -> bool:
+    """Return whether the machine hooks would provision this worktree."""
+
+    # A manifest with no integrations only owns a telemetry cleanup that an
+    # earlier uninstall could not finish. No machine hook runs, so it enrolls
+    # nothing.
+    if machine is None or not machine["integrations"]:
+        return False
+    # A clone that was deliberately uninstalled keeps its empty manifest.
+    if manifest is not None and not (
+        _user_scope(manifest)
+        and bool(manifest["enabled_worktrees"])
+        and str(repository.git_dir) not in manifest["enabled_worktrees"]
+    ):
+        return False
+    from .global_git_hooks import git_hooks_health, runs_machine_hooks
+
+    # A clone that runs broken machine Git hooks would have no working
+    # publisher. A reinstall repairs them.
+    record = machine.get("git_hooks")
+    return not (
+        runs_machine_hooks(repository.root, record)
+        and git_hooks_health(record).get("installed") is not True
+    )
+
+
+def can_machine_enroll(repo: str | Path) -> bool:
+    """Return whether the machine hooks will enroll this worktree at its next event.
+
+    The caller checks that the clone holds the hosted workflow.
+    """
+
+    from .user_install import load_user_manifest
+
+    try:
+        repository = _repository(repo)
+        return _enrollable(load_user_manifest(), repository, _load_manifest(repository))
+    except (OSError, ValueError):
+        return False
+
+
 def heal_worktree(repo: str | Path) -> bool:
     """Provision one enrolled clone from the machine-level install.
 
@@ -2301,18 +2344,8 @@ def heal_worktree(repo: str | Path) -> bool:
     from .user_install import load_user_manifest
 
     machine = load_user_manifest()
-    # A manifest with no integrations only owns a telemetry cleanup that an
-    # earlier uninstall could not finish. No machine hook runs, so it enrolls
-    # nothing.
-    if machine is None or not machine["integrations"]:
-        return False
     repository = _repository(repo)
-    manifest = _load_manifest(repository)
-    if manifest is not None and (
-        not _user_scope(manifest)
-        or not manifest["enabled_worktrees"]
-        or str(repository.git_dir) in manifest["enabled_worktrees"]
-    ):
+    if not _enrollable(machine, repository, _load_manifest(repository)):
         return False
     from .global_git_hooks import runs_machine_hooks
 

@@ -899,6 +899,29 @@ def _workflow_check(repository: GitHubRepository) -> tuple[str, str]:
     return "pass", "Trusted workflow and complete hosted runtime match this Joyride release."
 
 
+def _machine_hooks_cover(root: Path) -> bool:
+    """Return whether healthy machine hooks will enroll this clone by themselves.
+
+    A clone with the hosted workflow gets its own setup at its first hook
+    event, so it has no local installation before then. A clone that was
+    uninstalled keeps its empty manifest and never enrolls, and a clone that
+    would run broken machine Git hooks does not enroll either.
+    """
+
+    if not (root / _WORKFLOW_PATH).is_file():
+        return False
+    try:
+        from . import install
+        from .user_install import user_install_status
+
+        return (
+            user_install_status().get("installed") is True
+            and install.can_machine_enroll(root)
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def doctor(
     repo: str | Path = ".",
     *,
@@ -1056,6 +1079,15 @@ def doctor(
         local = {"installed": False, "warnings": [str(exc)]}
     if local.get("installed") is True:
         checks.append({"name": "local_installation", "state": "pass", "message": "Local attribution hooks are healthy."})
+    elif _machine_hooks_cover(repository.root):
+        checks.append({
+            "name": "local_installation",
+            "state": "pass",
+            "message": (
+                "Machine hooks are healthy. This clone finishes its own setup "
+                "at its first hook event."
+            ),
+        })
     else:
         checks.append({
             "name": "local_installation",

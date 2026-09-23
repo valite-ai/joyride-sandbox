@@ -12,10 +12,15 @@ Codex runs a hook from a ``hooks.json`` file only after the user reviews it in
   take no matcher drop it, and Interrupt and SessionEnd clamp the timeout to
   one to three seconds.
 
-Joyride writes the entries for its own handlers in one marked block per
-``hooks.json`` file and edits nothing else in ``config.toml``. If a later Codex
-release computes another hash, Codex reports the hook as modified and asks for
-a review, as it does today.
+Joyride appends the entries for its own handlers after one label comment and
+edits nothing else in ``config.toml``. Codex edits the same file: it adds
+``[projects."<path>"]`` tables and review decisions, and it can put a new table
+anywhere. So Joyride owns a table by its key and the hash that Joyride wrote,
+not by the bytes around it. Removal takes out only the ``trusted_hash`` line
+that Joyride wrote, and the table header when nothing else is left in it.
+
+If a later Codex release computes another hash, Codex reports the hook as
+modified and asks for a review, as it does today.
 """
 
 from __future__ import annotations
@@ -29,8 +34,11 @@ import tomllib
 from typing import Any, Mapping
 
 
-_BLOCK_BEGIN = "# >>> joyride-codex-hook-trust-v1"
-_BLOCK_END = "# <<< joyride-codex-hook-trust-v1"
+_LABEL = "# joyride-codex-hook-trust-v2"
+# Earlier releases wrapped the tables in these two comments and owned the bytes
+# between them. Codex put its own tables before the end comment.
+_LEGACY_BEGIN = "# >>> joyride-codex-hook-trust-v1"
+_LEGACY_END = "# <<< joyride-codex-hook-trust-v1"
 _LABELS = {
     "PreToolUse": "pre_tool_use",
     "PermissionRequest": "permission_request",
@@ -102,8 +110,161 @@ def trust_entries(
     return entries
 
 
-def _begin(hooks_path: Path) -> str:
-    return f"{_BLOCK_BEGIN} {hooks_path.parent.resolve() / hooks_path.name}"
+def _label(hooks_path: Path) -> str:
+    return f"{_LABEL} {hooks_path.parent.resolve() / hooks_path.name}"
+
+
+def _header(key: str) -> str:
+    return f"[hooks.state.{json.dumps(key)}]"
+
+
+def _value(value: str) -> str:
+    return f"trusted_hash = {json.dumps(value)}"
+
+
+def _owned(owned: Any) -> tuple[str | None, dict[str, str]]:
+    """Return the appended text and the entries that an earlier call wrote.
+
+    An earlier release recorded only the block text. Its entries are the
+    tables inside it.
+    """
+
+    if isinstance(owned, str):
+        try:
+            state = tomllib.loads(owned).get("hooks", {}).get("state", {})
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return owned, {}
+        entries = {
+            key: value["trusted_hash"]
+            for key, value in state.items()
+            if isinstance(value, dict) and isinstance(value.get("trusted_hash"), str)
+        }
+        return owned, entries
+    if isinstance(owned, Mapping):
+        block = owned.get("block") if isinstance(owned.get("block"), str) else None
+        entries = owned.get("entries")
+        if isinstance(entries, Mapping):
+            return block, {
+                str(key): value for key, value in entries.items() if isinstance(value, str)
+            }
+        return block, {}
+    return None, {}
+
+
+def _state(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    hooks = parsed.get("hooks")
+    state = hooks.get("state") if isinstance(hooks, dict) else None
+    return state if isinstance(state, dict) else {}
+
+
+def _intact(parsed: Mapping[str, Any], entries: Mapping[str, str]) -> dict[str, str]:
+    """Return the entries whose table still holds the hash that Joyride wrote."""
+
+    state = _state(parsed)
+    return {
+        key: value
+        for key, value in entries.items()
+        if isinstance(state.get(key), dict) and state[key].get("trusted_hash") == value
+    }
+
+
+def _without(parsed: dict[str, Any], keys: Any) -> dict[str, Any]:
+    """Return ``parsed`` without the trusted hashes of ``keys``, as TOML sees it."""
+
+    result = json.loads(json.dumps(parsed, default=str))
+    hooks = result.get("hooks")
+    state = hooks.get("state") if isinstance(hooks, dict) else None
+    if isinstance(state, dict):
+        for key in keys:
+            table = state.get(key)
+            if isinstance(table, dict):
+                table.pop("trusted_hash", None)
+                if not table:
+                    del state[key]
+    return _pruned(result)
+
+
+def _pruned(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Drop empty ``hooks.state`` and ``hooks`` tables, which carry no meaning."""
+
+    result = json.loads(json.dumps(parsed, default=str))
+    hooks = result.get("hooks")
+    if isinstance(hooks, dict):
+        if hooks.get("state") == {}:
+            del hooks["state"]
+        if not hooks:
+            del result["hooks"]
+    return result
+
+
+def _strip(text: str, entries: Mapping[str, str], labels: set[str]) -> str:
+    """Remove Joyride's label lines and the trusted hashes that it still owns.
+
+    A table header goes too when nothing but blank lines and comments remain
+    in its table, so a review decision that Codex wrote stays in place.
+    """
+
+    owned = {_header(key): _value(value) for key, value in entries.items()}
+    lines = text.splitlines(keepends=True)
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped in labels or stripped == _LEGACY_END:
+            index += 1
+            continue
+        if stripped not in owned:
+            kept.append(line)
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and not lines[end].lstrip().startswith("["):
+            end += 1
+        body = [
+            item
+            for item in lines[index + 1 : end]
+            if item.strip() not in labels and item.strip() != _LEGACY_END
+        ]
+        rest = [item for item in body if item.strip() != owned[stripped]]
+        meaningful = [item for item in rest if item.strip() and not item.lstrip().startswith("#")]
+        if meaningful or len(rest) == len(body):
+            kept.append(line)
+        kept.extend(rest)
+        index = end
+    return "".join(kept)
+
+
+def _remove(
+    text: str, hooks_path: Path | None, owned: Any, keep: Mapping[str, str] | None = None
+) -> str:
+    """Return ``text`` without the trust that ``owned`` names.
+
+    The hashes in ``keep`` stay where they are. Raises ValueError when the
+    result would change anything else.
+    """
+
+    block, entries = _owned(owned)
+    parsed = tomllib.loads(text)
+    intact = {
+        key: value for key, value in _intact(parsed, entries).items() if key not in (keep or {})
+    }
+    labels = {line.strip() for line in (block or "").splitlines() if line.startswith("# ")}
+    if hooks_path is not None:
+        labels |= {_label(hooks_path), f"{_LEGACY_BEGIN} {hooks_path.parent.resolve() / hooks_path.name}"}
+    whole = (
+        block is not None
+        and text.count(block) == 1
+        and _LEGACY_END not in text
+        and intact == entries == _owned(block)[1]
+    )
+    if whole:
+        updated = text.replace(block, "", 1)
+    else:
+        updated = _strip(text, intact, labels)
+    if _pruned(tomllib.loads(updated)) != _without(parsed, intact):
+        raise ValueError("Joyride could not separate its trust entries from other settings.")
+    return updated
 
 
 def _read(path: Path) -> tuple[str | None, int]:
@@ -130,25 +291,32 @@ def _write(path: Path, text: str, mode: int) -> None:
 
 
 def _plan(
-    text: str, hooks_path: Path, entries: Mapping[str, str], owned: str | None
-) -> tuple[str, str | None, list[str]]:
-    """Return the new file text, the block it holds, and keys left untrusted.
+    text: str, hooks_path: Path, entries: Mapping[str, str], owned: Any
+) -> tuple[str, dict[str, Any] | None, list[str]]:
+    """Return the new file text, what Joyride owns in it, and untrusted keys.
 
-    Raises ValueError when no block can be written.
+    Raises ValueError when no trust can be written.
     """
 
-    begin = _begin(hooks_path)
-    if begin in text:
-        if not owned or text.count(owned) != 1:
-            raise ValueError("The Joyride trust block was edited, so it was left unchanged.")
-        text = text.replace(owned, "", 1)
     try:
         parsed = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"The Codex configuration is not valid TOML: {exc}") from exc
-    hooks = parsed.get("hooks")
-    state = hooks.get("state") if isinstance(hooks, dict) else None
-    existing = state if isinstance(state, dict) else {}
+    block, previous = _owned(owned)
+    legacy = isinstance(owned, str) or _LEGACY_END in text
+    if not legacy and previous and _intact(parsed, previous) == dict(entries):
+        # Everything is in place. Tables that Codex added since do not matter.
+        return text, {"block": block, "entries": dict(entries)}, []
+    # A Joyride table that also holds a review decision that Codex wrote stays
+    # in place with its hash. Removing only the hash would revoke the trust.
+    state = _state(parsed)
+    in_place = {
+        key: value
+        for key, value in _intact(parsed, previous).items()
+        if entries.get(key) == value and set(state[key]) != {"trusted_hash"}
+    }
+    text = _remove(text, hooks_path, owned, keep=in_place)
+    existing = _state(tomllib.loads(text))
     # A table that the user or Codex already wrote cannot be defined twice.
     # One that holds another hash leaves that Joyride hook untrusted.
     kept = {key: value for key, value in entries.items() if key not in existing}
@@ -159,71 +327,76 @@ def _plan(
         and not (isinstance(existing[key], dict) and existing[key].get("trusted_hash") == value)
     ]
     if not kept:
-        return text, None, stale
-    lines = [begin]
+        return text, ({"block": None, "entries": in_place} if in_place else None), stale
+    lines = [_label(hooks_path)]
     for key, value in kept.items():
-        lines += [f"[hooks.state.{json.dumps(key)}]", f"trusted_hash = {json.dumps(value)}"]
-    lines.append(_BLOCK_END)
-    # The owned text holds the blank line before the block too, so removal
-    # restores the file byte for byte.
+        lines += [_header(key), _value(value)]
+    # The owned text holds the blank line before the tables too, so removal
+    # restores an untouched file byte for byte.
     if not text or text.endswith("\n\n"):
         separator = ""
     else:
         separator = "\n" if text.endswith("\n") else "\n\n"
-    block = separator + "\n".join(lines) + "\n"
-    updated = text + block
+    appended = separator + "\n".join(lines) + "\n"
+    updated = text + appended
     tomllib.loads(updated)
-    return updated, block, stale
+    return updated, {"block": appended, "entries": {**in_place, **kept}}, stale
 
 
 def apply_trust(
     config_path: Path,
     hooks_path: Path,
     entries: Mapping[str, str],
-    owned: str | None,
-) -> tuple[str | None, str | None]:
-    """Write the trust block and return it with an optional warning.
+    owned: Any,
+) -> tuple[Any, str | None]:
+    """Write the trust entries and return what Joyride owns with a warning.
 
-    ``owned`` is the block an earlier call returned. It is replaced only while
-    it is still byte-for-byte in the file, so a review decision that Codex
-    wrote into it is kept.
+    ``owned`` is what an earlier call returned, or the block text that an
+    earlier release recorded. Tables that Codex added, and review decisions
+    that it wrote into a Joyride table, are kept.
     """
 
     try:
         text, mode = _read(config_path)
         current = text or ""
-        updated, block, stale = _plan(current, hooks_path, entries, owned)
+        updated, result, stale = _plan(current, hooks_path, entries, owned)
     except (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+        # The caller keeps what it owned, so a later uninstall can remove it.
         return owned, f"Codex hook trust was not written to {config_path}: {exc}"
     if updated != current:
         _write(config_path, updated, mode)
     if stale:
-        return block, (
+        return result, (
             f"{config_path} already holds another trust record for "
             f"{len(stale)} Joyride hook(s), so Codex treats them as changed."
         )
-    return block, None
+    return result, None
 
 
 def remove_trust(
-    config_path: Path, owned: str | None, *, delete_empty: bool = False
+    config_path: Path,
+    owned: Any,
+    *,
+    hooks_path: Path | None = None,
+    delete_empty: bool = False,
 ) -> str | None:
-    """Remove the block that ``apply_trust`` wrote, and return a warning if kept.
+    """Remove the trust that ``apply_trust`` wrote, and return a warning if kept.
 
     ``delete_empty`` removes a file that Joyride created once nothing remains.
     """
 
-    if not owned:
+    _block, entries = _owned(owned)
+    if not entries:
         return None
     try:
         text, mode = _read(config_path)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        return f"Codex hook trust was not removed from {config_path}: {exc}"
-    if text is None:
+        if text is None:
+            return None
+        remaining = _remove(text, hooks_path, owned)
+    except (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+        return f"The Joyride hook trust in {config_path} was kept: {exc}"
+    if remaining == text:
         return None
-    if text.count(owned) != 1:
-        return f"The Joyride hook trust in {config_path} changed, so it was kept."
-    remaining = text.replace(owned, "", 1)
     if delete_empty and not remaining.strip():
         config_path.unlink()
     else:
