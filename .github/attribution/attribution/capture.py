@@ -215,6 +215,489 @@ def _snapshot(
     return files, skipped
 
 
+def _decoded_paths(output: bytes) -> list[str]:
+    paths: list[str] = []
+    for raw_path in output.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            paths.append(raw_path.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError("Git paths must be valid UTF-8 for attribution") from exc
+    return paths
+
+
+def _literal(paths: Sequence[str]) -> list[str]:
+    return [f":(literal){path}" for path in paths]
+
+
+def _eligible(content: bytes) -> tuple[bytes | None, str | None]:
+    if len(content) > MAX_TEXT_BYTES:
+        return None, "too_large"
+    if b"\0" in content:
+        return None, "binary"
+    return content, None
+
+
+def _read_snapshot_file(path: Path) -> tuple[bytes | None, str | None]:
+    """Read one file under the whole-tree snapshot rules.
+
+    The result is the content, ``(None, None)`` for an absent file, or
+    ``(None, reason)`` for a file that a snapshot skips.
+    """
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "unreadable"
+    if not stat.S_ISREG(metadata.st_mode):
+        return None, "not_regular"
+    if metadata.st_size > MAX_TEXT_BYTES:
+        return None, "too_large"
+    try:
+        with path.open("rb") as handle:
+            content = handle.read(MAX_TEXT_BYTES + 1)
+    except OSError:
+        return None, "unreadable"
+    return _eligible(content)
+
+
+def _targeted_snapshot(
+    repo: Path,
+    paths: Sequence[str],
+) -> tuple[dict[str, bytes | None], dict[str, str]] | None:
+    """Read only the named paths under the whole-tree snapshot rules.
+
+    ``None`` means that Git spells a named path differently or that a path
+    names a directory. The caller then snapshots the whole tree instead.
+    """
+
+    files: dict[str, bytes | None] = {}
+    skipped: dict[str, str] = {}
+    targets = sorted(set(paths))
+    if not targets:
+        return files, skipped
+    listed = set(
+        _decoded_paths(
+            _run_git(
+                repo,
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                *_literal(targets),
+            ).stdout
+        )
+    )
+    if not listed <= set(targets):
+        return None
+    unlisted = [path for path in targets if path not in listed and os.path.lexists(repo / path)]
+    ignored: set[str] = set()
+    if unlisted:
+        ignored = set(
+            _decoded_paths(
+                _run_git(
+                    repo,
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--",
+                    *_literal(unlisted),
+                ).stdout
+            )
+        )
+        if ignored != set(unlisted):
+            return None
+    for path in targets:
+        if path in ignored:
+            skipped[path] = "ignored_preexisting"
+        elif path in listed:
+            content, reason = _read_snapshot_file(repo / path)
+            if reason is None:
+                files[path] = content
+            else:
+                skipped[path] = reason
+    return files, skipped
+
+
+def _signature(path: str) -> list[int] | str | None:
+    """Return the metadata that changes when a file's content can change."""
+
+    try:
+        # A plain string keeps this cheap enough to run on every file.
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unreadable"
+    return [
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_size,
+        metadata.st_mode,
+        metadata.st_ino,
+    ]
+
+
+def _metadata_snapshot(
+    repo: Path,
+    *,
+    max_files: int,
+    max_total_bytes: int,
+) -> tuple[dict[str, object], dict[str, bytes | None], dict[str, str]]:
+    """Record a baseline for a tool that can change any file in the worktree.
+
+    Every eligible file contributes only its metadata. Content is copied only
+    where Git cannot restore the exact bytes later: untracked files, files that
+    differ from the index, and clean files whose bytes differ from their blobs.
+    Other clean files are read back from Git if they change.
+    A reached limit is reported under the empty path, which Git never uses.
+    """
+
+    started_ns = time.time_ns()
+    tracked: dict[str, bool] = {}
+    index_ids: dict[str, str] = {}
+    for line in _decoded_paths(_run_git(repo, "ls-files", "-z", "-s", "-v").stdout):
+        header, _tab, path = line.partition("\t")
+        tag, _mode, object_id, stage = header.split(" ")
+        # A lowercase tag marks assume-unchanged and S marks skip-worktree.
+        # Git reports no change for either, so their content is copied.
+        tracked[path] = tracked.get(path, False) or tag == "S" or tag.islower()
+        if stage == "0":
+            index_ids[path] = object_id
+    status = _run_git(
+        repo,
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+        "--ignore-submodules=all",
+        "--ignored=matching",
+    ).stdout
+    staged: dict[str, str] = {}
+    copied: set[str] = {path for path, forced in tracked.items() if forced}
+    untracked: list[str] = []
+    ignored: list[str] = []
+    for record in _decoded_paths(status):
+        kind = record[:1]
+        if kind == "?":
+            untracked.append(record[2:])
+        elif kind == "!":
+            ignored.append(record[2:])
+        elif kind == "1":
+            fields = record.split(" ", 8)
+            state, index_id, path = fields[1], fields[7], fields[8]
+            if state[1] != ".":
+                copied.add(path)
+            elif state[0] != "." and path in tracked:
+                staged[path] = index_id
+        elif kind == "u":
+            copied.add(record.split(" ", 10)[10])
+
+    skipped: dict[str, str] = {}
+    if len(tracked) + len(untracked) > max_files:
+        skipped[""] = "snapshot_file_limit"
+        return {}, {}, skipped
+    root = f"{repo}{os.sep}"
+    signatures = {path: _signature(root + path) for path in (*tracked, *untracked)}
+    copied.update(
+        _converted_paths(
+            repo,
+            sorted(path for path in index_ids if path not in copied),
+            index_ids,
+            signatures,
+        )
+    )
+    stored: dict[str, bytes | None] = {}
+    total_bytes = 0
+    for path in sorted(copied.intersection(tracked).union(untracked)):
+        content, reason = _read_snapshot_file(repo / path)
+        if reason is not None:
+            skipped[path] = reason
+            continue
+        if content is None:
+            continue
+        total_bytes += len(content)
+        if total_bytes > max_total_bytes:
+            return {}, {}, {"": "snapshot_total_limit"}
+        stored[path] = content
+    # A file that was ignored before the tool ran is never credited to it,
+    # even if the tool changes the ignore rules or force-adds the file.
+    for path in ignored:
+        skipped[path] = (
+            "ignored_preexisting_directory" if path.endswith("/") else "ignored_preexisting"
+        )
+    state = {"started_ns": started_ns, "signatures": signatures, "index": staged}
+    return state, stored, skipped
+
+
+def _git_output(repo: Path, *arguments: str, data: bytes = b"", allowed: int = 0) -> bytes:
+    """Run a read-only Git query that reads stdin. Exit code ``allowed`` means no match."""
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=system_subprocess_environment(),
+        check=False,
+    )
+    if result.returncode not in {0, allowed}:
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(message or "A Git query for the native snapshot failed")
+    return result.stdout
+
+
+def _blob_sizes(repo: Path, object_ids: Sequence[str]) -> dict[str, int]:
+    """Return each blob's stored size without reading its content."""
+
+    if not object_ids:
+        return {}
+    output = _git_output(
+        repo,
+        "cat-file",
+        "--batch-check",
+        data="".join(f"{object_id}\n" for object_id in object_ids).encode("ascii"),
+    )
+    sizes: dict[str, int] = {}
+    for line in output.decode("ascii").splitlines():
+        fields = line.split(" ")
+        if len(fields) == 3 and fields[1] == "blob":
+            sizes[fields[0]] = int(fields[2])
+    return sizes
+
+
+def _blobs(repo: Path, object_ids: Sequence[str]) -> dict[str, bytes]:
+    if not object_ids:
+        return {}
+    output = _git_output(
+        repo,
+        "cat-file",
+        "--batch",
+        data="".join(f"{object_id}\n" for object_id in object_ids).encode("ascii"),
+    )
+    blobs: dict[str, bytes] = {}
+    offset = 0
+    while offset < len(output):
+        header_end = output.index(b"\n", offset)
+        header = output[offset:header_end].decode("ascii").split(" ")
+        offset = header_end + 1
+        if header[-1] == "missing":
+            continue
+        size = int(header[2])
+        blobs[header[0]] = output[offset:offset + size]
+        offset += size + 1
+    return blobs
+
+
+def _converted_paths(
+    repo: Path,
+    paths: Sequence[str],
+    index_ids: Mapping[str, str],
+    signatures: Mapping[str, object],
+) -> set[str]:
+    """Return clean files whose worktree bytes can differ from their blobs.
+
+    Git reports a file clean when its worktree bytes convert to its blob, so
+    a clean file can hold other bytes than the blob. ``ident``,
+    ``working-tree-encoding``, and external filters are copied whenever they
+    apply. A line-ending conversion changes the size whenever it changes the
+    bytes, so a file under line-ending rules is copied only when its size
+    differs from its blob.
+    """
+
+    if not paths:
+        return set()
+    records = _git_output(
+        repo,
+        "check-attr",
+        "-z",
+        "--stdin",
+        "text",
+        "eol",
+        "ident",
+        "filter",
+        "working-tree-encoding",
+        data=b"".join(path.encode("utf-8") + b"\0" for path in paths),
+    ).split(b"\0")
+    autocrlf = _git_output(
+        repo, "config", "--get", "core.autocrlf", allowed=1
+    ).decode("utf-8", errors="replace").strip().lower()
+    attributes: dict[str, dict[str, str]] = {}
+    for index in range(0, len(records) - 2, 3):
+        attributes.setdefault(records[index].decode("utf-8"), {})[
+            records[index + 1].decode("ascii")
+        ] = records[index + 2].decode("utf-8", errors="replace")
+    unset = {"unspecified", "unset"}
+    converted: set[str] = set()
+    by_size: list[str] = []
+    for path in paths:
+        values = attributes.get(path, {})
+        if any(
+            values.get(name, "unspecified") not in unset
+            for name in ("ident", "filter", "working-tree-encoding")
+        ):
+            converted.add(path)
+        elif (
+            values.get("text") in {"set", "auto"}
+            or values.get("eol") in {"lf", "crlf"}
+            or (
+                values.get("text", "unspecified") == "unspecified"
+                and autocrlf in {"true", "input"}
+            )
+        ):
+            by_size.append(path)
+    sizes = _blob_sizes(repo, sorted({index_ids[path] for path in by_size}))
+    for path in by_size:
+        signature = signatures.get(path)
+        if isinstance(signature, list) and sizes.get(index_ids[path]) != signature[2]:
+            converted.add(path)
+    return converted
+
+
+def _committed_ids(repo: Path, commit: str, paths: Sequence[str]) -> dict[str, str]:
+    arguments = ["ls-tree", "-z", "-r", "--full-tree", commit]
+    if len(paths) <= 1000:
+        arguments.extend(["--", *_literal(paths)])
+    ids: dict[str, str] = {}
+    for record in _decoded_paths(_run_git(repo, *arguments).stdout):
+        header, _tab, path = record.partition("\t")
+        mode, kind, object_id = header.split(" ")
+        if kind == "blob" and not mode.startswith("12"):
+            ids[path] = object_id
+    return ids
+
+
+def _metadata_changes(
+    repo: Path,
+    state: Mapping[str, object],
+    stored: Mapping[str, bytes | None],
+    base_commit: str | None,
+    *,
+    max_files: int,
+    max_total_bytes: int,
+) -> tuple[dict[str, bytes | None], dict[str, str], dict[str, bytes | None], dict[str, str]]:
+    """Return before and after content for only the files whose metadata changed.
+
+    The result is ``(before, before_skipped, after, after_skipped)``. A reached
+    limit is reported in ``after_skipped`` under the empty path.
+    """
+
+    signatures = state["signatures"]
+    index_ids = state["index"]
+    if not isinstance(signatures, dict) or not isinstance(index_ids, dict):
+        raise ValueError("The native snapshot baseline is malformed")
+    # A file changed within two seconds of the baseline can change again
+    # without new metadata on a coarse clock, so its content is compared.
+    racy_after_ns = int(state["started_ns"]) - 2_000_000_000
+    listed = _listed_paths(repo)
+    if len(listed) > max_files:
+        return {}, {}, {}, {"": "snapshot_file_limit"}
+    after_skipped: dict[str, str] = {}
+    listed_set = set(listed)
+    root = f"{repo}{os.sep}"
+    changed: dict[str, list[int] | str | None] = {}
+    for path in sorted(listed_set.union(signatures)):
+        current = _signature(root + path)
+        if path not in signatures:
+            if path in listed_set:
+                changed[path] = current
+            continue
+        prior = signatures[path]
+        if prior != current or (isinstance(prior, list) and prior[0] >= racy_after_ns):
+            changed[path] = current
+
+    before: dict[str, bytes | None] = {}
+    before_skipped: dict[str, str] = {}
+    from_index: dict[str, str] = {}
+    from_commit: list[str] = []
+    for path in changed:
+        prior = signatures.get(path)
+        if path in stored:
+            before[path] = stored[path]
+        elif prior is None:
+            before[path] = None
+        elif prior == "unreadable":
+            before_skipped[path] = "unreadable"
+        elif not isinstance(prior, list) or not stat.S_ISREG(prior[3]):
+            before_skipped[path] = "not_regular"
+        elif path in index_ids:
+            from_index[path] = str(index_ids[path])
+        elif base_commit is not None:
+            from_commit.append(path)
+        else:
+            before_skipped[path] = "unreadable"
+    if from_commit:
+        committed = _committed_ids(repo, base_commit or "", from_commit)
+        for path in from_commit:
+            if path in committed:
+                from_index[path] = committed[path]
+            else:
+                before_skipped[path] = "unreadable"
+
+    # Every limit applies before any content is read, so an oversized blob
+    # or a large set of changed files never enters memory.
+    sizes = _blob_sizes(repo, sorted(set(from_index.values())))
+    planned = sum(len(content) for content in before.values() if content is not None)
+    for path, object_id in list(from_index.items()):
+        size = sizes.get(object_id)
+        if size is None or size > MAX_TEXT_BYTES:
+            before_skipped[path] = "unreadable" if size is None else "too_large"
+            del from_index[path]
+        else:
+            planned += size
+    for path, current in changed.items():
+        if (
+            path in listed_set
+            and isinstance(current, list)
+            and stat.S_ISREG(current[3])
+            and current[2] <= MAX_TEXT_BYTES
+        ):
+            planned += current[2]
+    if planned > max_total_bytes:
+        return {}, {}, {}, {"": "snapshot_total_limit"}
+
+    blobs = _blobs(repo, sorted(set(from_index.values())))
+    for path, object_id in from_index.items():
+        raw = blobs.get(object_id)
+        if raw is None:
+            before_skipped[path] = "unreadable"
+            continue
+        content, reason = _eligible(raw)
+        if reason is not None:
+            before_skipped[path] = reason
+        else:
+            before[path] = content
+
+    total_bytes = sum(len(content) for content in before.values() if content is not None)
+    after: dict[str, bytes | None] = {}
+    for path in changed:
+        if path in listed_set:
+            content, reason = _read_snapshot_file(repo / path)
+            if reason is not None:
+                after_skipped[path] = reason
+                continue
+            after[path] = content
+            total_bytes += len(content) if content is not None else 0
+        elif os.path.lexists(repo / path):
+            # Git lists every file that is not ignored, so the tool made
+            # this file ignored. It is not credited either way.
+            after_skipped[path] = "ignored_preexisting"
+        else:
+            after[path] = None
+        if total_bytes > max_total_bytes:
+            return {}, {}, {}, {"": "snapshot_total_limit"}
+    return before, before_skipped, after, after_skipped
+
+
 @contextmanager
 def _worktree_lock(
     repo: Path,

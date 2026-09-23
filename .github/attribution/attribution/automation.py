@@ -10,9 +10,19 @@ import sqlite3
 import subprocess
 from typing import Any
 import uuid
+import zlib
 
 from . import activity, traces
-from .capture import _base_commit, _content_hash, _snapshot, _utc_now, _worktree_lock
+from .capture import (
+    _base_commit,
+    _content_hash,
+    _metadata_changes,
+    _metadata_snapshot,
+    _snapshot,
+    _targeted_snapshot,
+    _utc_now,
+    _worktree_lock,
+)
 from .hosted_runtime import WORKFLOW_PATH
 from .notes import _record_commit_locked
 from .runtime import system_subprocess_environment
@@ -39,7 +49,9 @@ KNOWN_EVENTS = frozenset(
 )
 ACTIVE_CAPTURE_STATES = ("pending", "contaminated", "limited", "imported")
 INSTALL_STATE_VERSION = 1
-MAX_NATIVE_SNAPSHOT_FILES = 10_000
+# A tool that can change any file walks at most this many files, and copies
+# and compares at most this much text. An edit tool reads only its named files.
+MAX_NATIVE_SNAPSHOT_FILES = 100_000
 MAX_NATIVE_SNAPSHOT_BYTES = 32 * 1024 * 1024
 # A session counts the events it saw itself, so each one names the counter it
 # advances. SessionEnd ends no turn, and a subagent stop ends its child's turn
@@ -284,6 +296,76 @@ def _takes_snapshot(harness: str, payload: Mapping[str, Any]) -> bool:
     """Return whether one tool event needs the worktree snapshot pair."""
 
     return activity.takes_snapshot(harness, _optional_text(payload, "tool_name"))
+
+
+_PATCH_TARGET_PREFIXES = (
+    "*** Add File: ",
+    "*** Delete File: ",
+    "*** Update File: ",
+    "*** Move to: ",
+)
+_OUTSIDE = object()
+
+
+def _repository_path(value: object, cwd: str | None, repo: Path) -> object:
+    """Return a tool path relative to ``repo``, ``_OUTSIDE``, or ``None``."""
+
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        if cwd is None or not Path(cwd).is_absolute():
+            return None
+        path = Path(cwd) / path
+    # Resolving the path follows a link to the file that the tool changes.
+    try:
+        relative = Path(os.path.realpath(path)).relative_to(repo.resolve())
+    except ValueError:
+        return _OUTSIDE
+    if not relative.parts:
+        return None
+    if any(part.casefold() == ".git" for part in relative.parts):
+        return _OUTSIDE
+    return relative.as_posix()
+
+
+def _snapshot_targets(repo: Path, harness: str, payload: Mapping[str, Any]) -> list[str] | None:
+    """Return the repository files that one edit tool can change.
+
+    ``None`` means that the tool can change any file, or that its input names
+    no path this receiver can trust. The caller then snapshots the whole tree.
+    """
+
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, Mapping):
+        return None
+    tool_name = _optional_text(payload, "tool_name")
+    if harness == "claude-code" and tool_name in {"Write", "Edit", "MultiEdit"}:
+        values: list[object] = [tool_input.get("file_path")]
+    elif harness == "claude-code" and tool_name == "NotebookEdit":
+        values = [tool_input.get("notebook_path")]
+    elif harness == "codex" and tool_name in {"apply_patch", "Edit", "Write"}:
+        patch = tool_input.get("command")
+        if not isinstance(patch, str):
+            return None
+        values = [
+            line[len(prefix):].strip()
+            for line in patch.splitlines()
+            for prefix in _PATCH_TARGET_PREFIXES
+            if line.startswith(prefix)
+        ]
+        if not values:
+            return None
+    else:
+        return None
+    targets: list[str] = []
+    for value in values:
+        target = _repository_path(value, _optional_text(payload, "cwd"), repo)
+        if target is None:
+            return None
+        if isinstance(target, str):
+            targets.append(target)
+    return targets
 
 
 def _retain_facets(
@@ -780,12 +862,22 @@ def _handle_pre(
             if existing is not None:
                 return _result("ignored", session_id=existing["ledger_session_id"])
 
-            before, skipped = _snapshot(
-                repo,
-                max_files=MAX_NATIVE_SNAPSHOT_FILES,
-                max_total_bytes=MAX_NATIVE_SNAPSHOT_BYTES,
-                include_ignored=True,
-            )
+            targets = _snapshot_targets(repo, harness, payload)
+            targeted = _targeted_snapshot(repo, targets) if targets is not None else None
+            if targeted is not None:
+                before, skipped = targeted
+                snapshot_scope = "targeted"
+                snapshot_state = json.dumps({"paths": sorted(set(targets or []))}).encode()
+            else:
+                state, before, skipped = _metadata_snapshot(
+                    repo,
+                    max_files=MAX_NATIVE_SNAPSHOT_FILES,
+                    max_total_bytes=MAX_NATIVE_SNAPSHOT_BYTES,
+                )
+                snapshot_scope = "metadata"
+                snapshot_state = zlib.compress(
+                    json.dumps(state, separators=(",", ":")).encode(), 1
+                )
             started_at = _utc_now()
             base_commit = _base_commit(repo)
             model, model_source, feature, feature_source = _session_context(
@@ -841,8 +933,9 @@ def _handle_pre(
                 """
                 INSERT INTO hook_captures(
                     id, worktree_id, harness, native_session_id, tool_use_id,
-                    turn_id, ledger_session_id, base_commit, started_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    turn_id, ledger_session_id, base_commit, started_at, status,
+                    snapshot_scope, snapshot_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     capture_id,
@@ -855,6 +948,8 @@ def _handle_pre(
                     base_commit,
                     started_at,
                     "contaminated" if overlap else ("limited" if limited else "pending"),
+                    snapshot_scope,
+                    None if limited or overlap else snapshot_state,
                 ),
             )
             for path in ([] if limited else sorted(set(before) | set(skipped))):
@@ -1067,17 +1162,54 @@ def _handle_post(
             if capture_status not in ACTIVE_CAPTURE_STATES:
                 duplicate = True
             else:
+                before_rows = _before_rows(connection, capture["id"])
+                before_contents = {
+                    path: (
+                        bytes(row["before_content"])
+                        if row["before_content"] is not None
+                        else None
+                    )
+                    for path, row in before_rows.items()
+                    if row["skip_reason"] is None
+                }
+                before_skipped = {
+                    path: row["skip_reason"]
+                    for path, row in before_rows.items()
+                    if row["skip_reason"] is not None
+                }
+                after: dict[str, bytes | None] = {}
+                after_skips: dict[str, str] = {}
                 if capture_status in {"contaminated", "limited", "imported"}:
-                    after: dict[str, bytes | None] = {}
-                    after_skips: dict[str, str] = {}
+                    pass
+                elif capture["snapshot_scope"] == "metadata":
+                    before_contents, changed_skips, after, after_skips = _metadata_changes(
+                        repo,
+                        json.loads(zlib.decompress(capture["snapshot_state"])),
+                        before_contents,
+                        capture["base_commit"],
+                        max_files=MAX_NATIVE_SNAPSHOT_FILES,
+                        max_total_bytes=MAX_NATIVE_SNAPSHOT_BYTES,
+                    )
+                    before_skipped.update(changed_skips)
+                elif capture["snapshot_scope"] == "targeted":
+                    targeted = _targeted_snapshot(
+                        repo, json.loads(capture["snapshot_state"])["paths"]
+                    )
+                    if targeted is None:
+                        # Git no longer spells a named path the way it did
+                        # before the tool ran, so no delta can be trusted.
+                        after_skips = {"": "snapshot_target_changed"}
+                    else:
+                        after, after_skips = targeted
                 else:
+                    # A capture from before targeted snapshots holds the
+                    # whole tree, so it needs the whole tree again.
                     after, after_skips = _snapshot(
                         repo,
                         max_files=MAX_NATIVE_SNAPSHOT_FILES,
                         max_total_bytes=MAX_NATIVE_SNAPSHOT_BYTES,
                         include_ignored=True,
                     )
-                before_rows = _before_rows(connection, capture["id"])
                 if harness == "claude-code" and _direct_model(harness, event, payload) is None:
                     # An explicit model on Claude's matching Pre event is valid
                     # evidence for that tool interval even though Post commonly
@@ -1159,11 +1291,6 @@ def _handle_post(
                         "The bounded native snapshot limit was reached; this tool's file deltas were left unknown."
                     )
                 else:
-                    before_skipped = {
-                        path: row["skip_reason"]
-                        for path, row in before_rows.items()
-                        if row["skip_reason"] is not None
-                    }
                     ignored_directories = [
                         path
                         for path, reason in before_skipped.items()
@@ -1174,19 +1301,15 @@ def _handle_post(
                         for path, reason in after_skips.items()
                         if reason == "ignored_preexisting_directory"
                     )
-                    for path in sorted(set(before_rows) | set(after) | set(after_skips)):
+                    paths = set(before_rows) | set(before_contents) | set(after) | set(after_skips)
+                    for path in sorted(paths):
                         if (
                             path in before_skipped
                             or path in after_skips
                             or any(path.startswith(directory) for directory in ignored_directories)
                         ):
                             continue
-                        before_row = before_rows.get(path)
-                        before_content = (
-                            bytes(before_row["before_content"])
-                            if before_row is not None and before_row["before_content"] is not None
-                            else None
-                        )
+                        before_content = before_contents.get(path)
                         after_content = after.get(path)
                         if before_content == after_content:
                             continue
@@ -2063,7 +2186,11 @@ def automation_status(repo: RepoPath) -> dict[str, object]:
             )
         if limited:
             warnings.append(
-                f"{limited} native capture(s) exceeded snapshot limits and were kept unattributed."
+                f"{limited} native capture(s) exceeded the snapshot limits "
+                f"({MAX_NATIVE_SNAPSHOT_FILES:,} files, or "
+                f"{MAX_NATIVE_SNAPSHOT_BYTES // (1024 * 1024)} MiB of uncommitted or changed text) "
+                "and were kept unattributed. "
+                "Edit and Write tools have no repository size limit."
             )
         if imported:
             warnings.append(

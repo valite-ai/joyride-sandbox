@@ -143,6 +143,8 @@ CREATE TABLE IF NOT EXISTS hook_captures (
     base_commit TEXT NULL,
     started_at TEXT NOT NULL,
     status TEXT NOT NULL,
+    snapshot_scope TEXT NULL,
+    snapshot_state BLOB NULL,
     UNIQUE (worktree_id, harness, native_session_id, tool_use_id),
     FOREIGN KEY (ledger_session_id) REFERENCES sessions(id)
 );
@@ -503,6 +505,16 @@ def open_db(repo: RepoPath) -> sqlite3.Connection:
             }
             if "turn_id" not in capture_columns:
                 connection.execute("ALTER TABLE hook_captures ADD COLUMN turn_id TEXT")
+            # A capture without a scope predates targeted snapshots and keeps
+            # the whole-tree content snapshot that its pre-tool hook stored.
+            for name, declaration in (
+                ("snapshot_scope", "TEXT"),
+                ("snapshot_state", "BLOB"),
+            ):
+                if name not in capture_columns:
+                    connection.execute(
+                        f"ALTER TABLE hook_captures ADD COLUMN {name} {declaration}"
+                    )
 
             snapshot_columns = {
                 row["name"]
