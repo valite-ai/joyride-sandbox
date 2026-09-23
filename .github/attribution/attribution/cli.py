@@ -119,6 +119,14 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Install the harness hooks once for this machine",
     )
+    install.add_argument(
+        "--code",
+        help="One-time code from a team invite, sent to the hosted service after the install",
+    )
+    install.add_argument(
+        "--hosted-url",
+        help="Hosted HTTPS origin that receives --code (default: ATTRIBUTION_HOSTED_URL)",
+    )
     _repo_option(install)
 
     uninstall = commands.add_parser(
@@ -490,6 +498,28 @@ def _read_hook_payload() -> dict[str, Any]:
     return payload
 
 
+def _report_install(hosted_url: str | None, code: str | None) -> None:
+    """Send a team invite's one-time code after a finished install."""
+
+    if code is None or hosted_url is None:
+        return
+    from .install_code import InstallCodeError, redeem_install_code
+    from .terminal import safe_text
+
+    try:
+        redeemed = redeem_install_code(hosted_url, code)
+    except InstallCodeError as exc:
+        # The install itself succeeded, so a refused code only loses the early signal.
+        _emit(
+            f"Joyride is installed, but the service did not record the install: {safe_text(str(exc))} "
+            "The walkthrough still detects capture after your first published report.",
+            stream=sys.stderr,
+        )
+        return
+    team = f" in {safe_text(redeemed['team'])}" if redeemed["team"] else ""
+    _emit(f"Joyride recorded this install for {redeemed['login']}{team}.")
+
+
 def main(argv: list[str] | None = None) -> int:
     command_parser = parser()
     args = command_parser.parse_args(argv)
@@ -555,16 +585,21 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.action == "install":
+            hosted_url = args.hosted_url or os.environ.get("ATTRIBUTION_HOSTED_URL")
+            if args.code is not None and not hosted_url:
+                raise ValueError("--code needs --hosted-url or ATTRIBUTION_HOSTED_URL.")
             if args.user:
                 from .terminal import render_user_setup
                 from .user_install import install_user_hooks
 
                 _emit(render_user_setup(install_user_hooks(), installed=True))
+                _report_install(hosted_url, args.code)
                 return 0
             from .install import install_repo
 
             status = install_repo(_selected_repo(args), traces_enabled=not args.no_traces)
             _emit(_setup_message(status, installed=True))
+            _report_install(hosted_url, args.code)
             return 0
 
         if args.action == "uninstall":
