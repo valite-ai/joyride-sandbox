@@ -963,6 +963,25 @@ def _user_scope(manifest: dict[str, Any]) -> bool:
     return manifest.get("hook_scope") == _HOOK_SCOPE_USER
 
 
+def _machine_git_hooks(repository: _Repository) -> tuple[bool, str | None]:
+    """Return whether Git runs the machine hooks here, and why not."""
+
+    from .global_git_hooks import git_hooks_health, runs_machine_hooks
+    from .user_install import load_user_manifest
+
+    try:
+        machine = load_user_manifest()
+    except (OSError, ValueError) as exc:
+        return False, str(exc)
+    record = machine.get("git_hooks") if machine is not None else None
+    health = git_hooks_health(record)
+    if not health["installed"]:
+        return False, health["message"]
+    if not runs_machine_hooks(repository.root, record):
+        return False, "A repository core.hooksPath overrides the machine Git hooks."
+    return True, None
+
+
 def _user_hook_health() -> dict[str, dict[str, Any]]:
     from .user_install import user_hook_health
 
@@ -999,19 +1018,27 @@ def _worktree_health(
     managed_path = repository.managed_hooks_path
     messages: list[str] = []
 
-    try:
-        local_present, local_value = _local_hooks_path(repository)
-        effective_ok, effective_value = _effective_hooks_match(
-            repository, managed_path
-        )
-    except ValueError as exc:
-        local_present, local_value = False, None
-        effective_ok, effective_value = False, None
-        messages.append(str(exc))
-    local_ok = local_present and local_value == str(managed_path)
-    if enabled and not local_ok:
-        messages.append("The repository-local Git hook dispatcher is not configured.")
-    if enabled and not effective_ok:
+    machine_git = manifest.get("git_hook_scope") == _HOOK_SCOPE_USER
+    if machine_git:
+        machine_ok, machine_message = _machine_git_hooks(repository)
+        local_ok = effective_ok = machine_ok
+        effective_value = None
+        if enabled and machine_message:
+            messages.append(machine_message)
+    else:
+        try:
+            local_present, local_value = _local_hooks_path(repository)
+            effective_ok, effective_value = _effective_hooks_match(
+                repository, managed_path
+            )
+        except ValueError as exc:
+            local_present, local_value = False, None
+            effective_ok, effective_value = False, None
+            messages.append(str(exc))
+        local_ok = local_present and local_value == str(managed_path)
+        if enabled and not local_ok:
+            messages.append("The repository-local Git hook dispatcher is not configured.")
+    if enabled and not effective_ok and not machine_git:
         if effective_value is None:
             messages.append("The effective Git hooks path could not be resolved.")
         else:
@@ -1541,6 +1568,9 @@ def installation_status(repo: str | Path) -> dict[str, Any]:
         runtime = None
     user_scope = _user_scope(manifest)
     base["hook_scope"] = _HOOK_SCOPE_USER if user_scope else "repository"
+    if user_scope:
+        # Machine hooks need no Codex review; the machine install trusts them.
+        base["notice"] = "Restart existing coding sessions so they load hooks."
     user_health = _user_hook_health() if user_scope else {}
     for harness, relative in _INTEGRATION_PATHS.items():
         if user_scope:
@@ -1618,79 +1648,86 @@ def installation_status(repo: str | Path) -> dict[str, Any]:
         base["warnings"] = list(dict.fromkeys(warnings))
         return base
 
-    try:
-        local_present, local_value = _local_hooks_path(repository)
-        effective_ok, _effective_value = _effective_hooks_match(
-            repository, repository.managed_hooks_path
-        )
-    except ValueError as exc:
-        local_present, local_value = False, None
-        effective_ok = False
-        warnings.append(str(exc))
-    managed_path = str(repository.managed_hooks_path)
-    proxy_hashes = manifest.get("proxy_hashes", {})
-    proxy_ok = isinstance(proxy_hashes, dict) and bool(proxy_hashes)
-    try:
-        if not isinstance(proxy_hashes, dict):
-            raise ValueError("The install manifest has invalid Git proxy metadata.")
-        for name, expected_hash in proxy_hashes.items():
-            if (
-                not isinstance(name, str)
-                or Path(name).name != name
-                or name in {".", ".."}
-                or not isinstance(expected_hash, str)
-            ):
-                raise ValueError("The install manifest contains an invalid Git proxy name.")
-            proxy_path = repository.managed_hooks_path / name
-            _safe_private_path(proxy_path, repository)
-            proxy_raw, proxy_mode, _atime, _mtime = _file_details(proxy_path)
-            if expected_hash != _sha256(proxy_raw) or not proxy_mode & 0o111:
-                proxy_ok = False
-        for required in ("post-commit", "post-merge"):
-            if required not in proxy_hashes:
-                proxy_ok = False
-        runtime = _manifest_runtime(manifest)
-        if runtime.standalone:
-            try:
-                repository.bootstrap_path.lstat()
-                bootstrap_present = True
-            except FileNotFoundError:
-                bootstrap_present = False
-            if (
-                bootstrap_present
-                or manifest.get("bootstrap_sha256") is not None
-            ):
-                proxy_ok = False
-        else:
-            bootstrap_raw, bootstrap_mode, _atime, _mtime = _file_details(
-                repository.bootstrap_path
+    if manifest.get("git_hook_scope") == _HOOK_SCOPE_USER:
+        # The machine Git hooks serve this clone, so it owns no dispatcher.
+        proxy_ok, machine_message = _machine_git_hooks(repository)
+        base["git_hook_installed"] = bool(selected_enabled and proxy_ok)
+        if selected_enabled and machine_message:
+            warnings.append(machine_message)
+    else:
+        try:
+            local_present, local_value = _local_hooks_path(repository)
+            effective_ok, _effective_value = _effective_hooks_match(
+                repository, repository.managed_hooks_path
             )
+        except ValueError as exc:
+            local_present, local_value = False, None
+            effective_ok = False
+            warnings.append(str(exc))
+        managed_path = str(repository.managed_hooks_path)
+        proxy_hashes = manifest.get("proxy_hashes", {})
+        proxy_ok = isinstance(proxy_hashes, dict) and bool(proxy_hashes)
+        try:
+            if not isinstance(proxy_hashes, dict):
+                raise ValueError("The install manifest has invalid Git proxy metadata.")
+            for name, expected_hash in proxy_hashes.items():
+                if (
+                    not isinstance(name, str)
+                    or Path(name).name != name
+                    or name in {".", ".."}
+                    or not isinstance(expected_hash, str)
+                ):
+                    raise ValueError("The install manifest contains an invalid Git proxy name.")
+                proxy_path = repository.managed_hooks_path / name
+                _safe_private_path(proxy_path, repository)
+                proxy_raw, proxy_mode, _atime, _mtime = _file_details(proxy_path)
+                if expected_hash != _sha256(proxy_raw) or not proxy_mode & 0o111:
+                    proxy_ok = False
+            for required in ("post-commit", "post-merge"):
+                if required not in proxy_hashes:
+                    proxy_ok = False
+            runtime = _manifest_runtime(manifest)
+            if runtime.standalone:
+                try:
+                    repository.bootstrap_path.lstat()
+                    bootstrap_present = True
+                except FileNotFoundError:
+                    bootstrap_present = False
+                if (
+                    bootstrap_present
+                    or manifest.get("bootstrap_sha256") is not None
+                ):
+                    proxy_ok = False
+            else:
+                bootstrap_raw, bootstrap_mode, _atime, _mtime = _file_details(
+                    repository.bootstrap_path
+                )
+                if (
+                    manifest.get("bootstrap_sha256") != _sha256(bootstrap_raw)
+                    or not bootstrap_mode & 0o111
+                ):
+                    proxy_ok = False
             if (
-                manifest.get("bootstrap_sha256") != _sha256(bootstrap_raw)
-                or not bootstrap_mode & 0o111
+                not runtime.executable.is_file()
+                or not os.access(runtime.executable, os.X_OK)
+                or runtime.source_root is not None
+                and not runtime.source_root.is_dir()
             ):
                 proxy_ok = False
-        if (
-            not runtime.executable.is_file()
-            or not os.access(runtime.executable, os.X_OK)
-            or runtime.source_root is not None
-            and not runtime.source_root.is_dir()
-        ):
+        except (OSError, ValueError) as exc:
             proxy_ok = False
-    except (OSError, ValueError) as exc:
-        proxy_ok = False
-        warnings.append(str(exc))
-    base["git_hook_installed"] = bool(
-        selected_enabled
-        and local_present
-        and local_value == managed_path
-        and effective_ok
-        and proxy_ok
-    )
-    if selected_enabled and not effective_ok:
-        warnings.append(
-            "A worktree-specific core.hooksPath overrides the attribution dispatcher."
+            warnings.append(str(exc))
+        base["git_hook_installed"] = bool(
+            selected_enabled
+            and local_present
+            and local_value == managed_path
+            and effective_ok
+            and proxy_ok
         )
+        if selected_enabled and not effective_ok:
+            warnings.append(
+                "A worktree-specific core.hooksPath overrides the attribution dispatcher."
+            )
     if selected_enabled and not base["git_hook_installed"]:
         warnings.append("The managed Git hook dispatcher needs attention.")
     base["installed"] = bool(
@@ -1744,6 +1781,7 @@ def _install_worktree(
     traces_enabled: bool | None = None,
     native_hooks: bool = True,
     telemetry: bool | None = None,
+    machine_git_hooks: bool = False,
 ) -> dict[str, Any]:
     """Idempotently install native and Git automation for one worktree.
 
@@ -1752,6 +1790,9 @@ def _install_worktree(
     worktree receives its Git publisher and a manifest with the user scope.
     ``telemetry`` defaults to ``native_hooks``; the machine install passes its
     own choice so that the clone registers sessions for cost matching.
+    ``machine_git_hooks`` is true when Git already runs the machine Git hooks
+    here. The repository then gets no dispatcher of its own. An active
+    repository keeps the Git hook scope that it recorded.
     """
 
     repository = _repository(repo)
@@ -1765,8 +1806,19 @@ def _install_worktree(
     manifest = _load_manifest(repository)
     active = bool(manifest and manifest["enabled_worktrees"])
     local_before = _local_hooks_path(repository)
+    machine_git = (
+        manifest.get("git_hook_scope") == _HOOK_SCOPE_USER
+        if active and manifest is not None
+        else machine_git_hooks
+    )
+    # Machine Git hooks that no longer run here, for example after
+    # `joyride uninstall --user`, leave the clone without Git dispatch. It
+    # then gets a dispatcher of its own, set up from the current state.
+    lapsed = active and machine_git and not _machine_git_hooks(repository)[0]
+    if lapsed:
+        machine_git = False
 
-    if active:
+    if active and not machine_git and not lapsed:
         assert manifest is not None
         try:
             installed_runtime = _manifest_runtime(manifest)
@@ -1794,6 +1846,27 @@ def _install_worktree(
         original_hooks_path = manifest.get("previous_effective_hooks_path")
         if not isinstance(original_hooks_path, str):
             raise ValueError("The active install manifest is missing the original hooks path.")
+    elif active and not lapsed:
+        assert manifest is not None
+        original_hooks_path = manifest.get("previous_effective_hooks_path")
+        if not isinstance(original_hooks_path, str):
+            raise ValueError("The active install manifest is missing the original hooks path.")
+    elif lapsed:
+        assert manifest is not None
+        original_hooks_path = _effective_hooks_path(repository)
+        if (
+            _resolve_original_directory(repository, original_hooks_path).resolve()
+            == repository.managed_hooks_path
+        ):
+            raise ValueError("The existing core.hooksPath conflicts with attribution's private path.")
+        manifest["previous_local_hooks_path"] = {
+            "present": local_before[0],
+            "value": local_before[1],
+        }
+        manifest["previous_effective_hooks_path"] = original_hooks_path
+        manifest["managed_hooks_path"] = str(repository.managed_hooks_path)
+        manifest["proxy_hashes"] = {}
+        manifest.pop("bootstrap_sha256", None)
     else:
         original_hooks_path = _effective_hooks_path(repository)
         if (
@@ -1823,7 +1896,7 @@ def _install_worktree(
     _safe_private_path(repository.manifest_path, repository)
     _safe_private_path(repository.bootstrap_path, repository)
     _safe_private_path(repository.managed_hooks_path, repository)
-    if repository.managed_hooks_path.exists() and not active:
+    if repository.managed_hooks_path.exists() and not active and not machine_git:
         try:
             if any(repository.managed_hooks_path.iterdir()):
                 raise ValueError(
@@ -1834,12 +1907,12 @@ def _install_worktree(
 
     bootstrap = (
         _bootstrap_bytes(runtime.source_root)
-        if runtime.source_root is not None
+        if runtime.source_root is not None and not machine_git
         else None
     )
     try:
         repository.bootstrap_path.lstat()
-        bootstrap_exists = True
+        bootstrap_exists = not machine_git
     except FileNotFoundError:
         bootstrap_exists = False
     if bootstrap_exists:
@@ -1855,8 +1928,10 @@ def _install_worktree(
         if current != bootstrap:
             raise ValueError("The private attribution bootstrap conflicts with this runtime.")
 
-    hook_names = _discovered_hook_names(repository, original_hooks_path)
-    existing_proxy_hashes = manifest.get("proxy_hashes", {})
+    hook_names = (
+        set() if machine_git else _discovered_hook_names(repository, original_hooks_path)
+    )
+    existing_proxy_hashes = {} if machine_git else manifest.get("proxy_hashes", {})
     if not isinstance(existing_proxy_hashes, dict):
         raise ValueError("The install manifest has invalid Git proxy metadata.")
     # Generate persistent hooks only from the validated values that will be
@@ -2138,9 +2213,16 @@ def _install_worktree(
         manifest.pop("hook_scope", None)
     else:
         manifest["hook_scope"] = _HOOK_SCOPE_USER
+    if machine_git:
+        manifest["git_hook_scope"] = _HOOK_SCOPE_USER
+    else:
+        manifest.pop("git_hook_scope", None)
 
     transaction = _Transaction()
-    config_changed = local_before != (True, str(repository.managed_hooks_path))
+    config_changed = not machine_git and local_before != (
+        True,
+        str(repository.managed_hooks_path),
+    )
     try:
         for (
             record,
@@ -2173,9 +2255,9 @@ def _install_worktree(
                 transaction.write(path, payload, mode=0o755)
         if config_changed:
             _set_local_hooks_path(repository, str(repository.managed_hooks_path))
-        effective_ok, _effective_value = _effective_hooks_match(
+        effective_ok = machine_git or _effective_hooks_match(
             repository, repository.managed_hooks_path
-        )
+        )[0]
         if not effective_ok:
             raise ValueError(
                 "A worktree-specific core.hooksPath overrides attribution's Git hook "
@@ -2232,12 +2314,106 @@ def heal_worktree(repo: str | Path) -> bool:
         or str(repository.git_dir) in manifest["enabled_worktrees"]
     ):
         return False
+    from .global_git_hooks import runs_machine_hooks
+
     _install_worktree(
         repository.root,
         native_hooks=False,
         telemetry=machine.get("telemetry_enabled") is True,
+        machine_git_hooks=runs_machine_hooks(repository.root, machine.get("git_hooks")),
     )
     return True
+
+
+def adopt_machine_git_hooks(repo: str | Path) -> bool:
+    """Move a clone from its own Git hook dispatcher to the machine Git hooks.
+
+    Clones that an earlier machine install provisioned route Git to a
+    per-clone dispatcher through a repository ``core.hooksPath``. That setting
+    hides the machine hooks. This removes it, with the dispatcher files, when
+    the clone had no ``core.hooksPath`` of its own before Joyride and Git then
+    runs the machine hooks. Returns whether the clone moved.
+    """
+
+    from .global_git_hooks import runs_machine_hooks
+    from .user_install import load_user_manifest
+
+    repository = _repository(repo)
+    manifest = _load_manifest(repository)
+    if (
+        manifest is None
+        or not _user_scope(manifest)
+        or manifest.get("git_hook_scope") == _HOOK_SCOPE_USER
+        or not manifest["enabled_worktrees"]
+    ):
+        return False
+    machine = load_user_manifest()
+    record = machine.get("git_hooks") if machine is not None else None
+    previous = manifest.get("previous_local_hooks_path")
+    managed = str(repository.managed_hooks_path)
+    if (
+        not isinstance(record, dict)
+        or not isinstance(previous, dict)
+        or previous.get("present") is not False
+        or _local_hooks_path(repository) != (True, managed)
+    ):
+        return False
+    _restore_local_hooks_path(repository, (False, None))
+    if not runs_machine_hooks(repository.root, record):
+        _set_local_hooks_path(repository, managed)
+        return False
+    hashes = manifest.get("proxy_hashes")
+    for name, expected in (hashes.items() if isinstance(hashes, dict) else ()):
+        path = repository.managed_hooks_path / str(name)
+        try:
+            raw, _mode, _atime, _mtime = _file_details(path)
+        except (FileNotFoundError, ValueError):
+            continue
+        if expected == _sha256(raw):
+            path.unlink()
+    try:
+        raw, _mode, _atime, _mtime = _file_details(repository.bootstrap_path)
+    except (FileNotFoundError, ValueError):
+        pass
+    else:
+        if manifest.get("bootstrap_sha256") == _sha256(raw):
+            repository.bootstrap_path.unlink()
+    manifest["git_hook_scope"] = _HOOK_SCOPE_USER
+    manifest["proxy_hashes"] = {}
+    manifest.pop("bootstrap_sha256", None)
+    _atomic_write(repository.manifest_path, _manifest_bytes(manifest), mode=0o600)
+    return True
+
+
+def _reinstall_user_scope(
+    selected: _Repository,
+    machine: dict[str, Any],
+    *,
+    all_worktrees: bool,
+    traces_enabled: bool,
+) -> dict[str, Any]:
+    """Apply a repository install's trace choice to a clone under machine hooks."""
+
+    from .global_git_hooks import runs_machine_hooks
+
+    if os.environ.get(_CURRENT_WORKTREE_ONLY_ENV) == "1":
+        all_worktrees = False
+    if all_worktrees:
+        worktrees, warnings = _discover_worktrees(selected)
+    else:
+        worktrees, warnings = [_LinkedWorktree(selected, None)], []
+    for worktree in worktrees:
+        candidate = worktree.repository
+        _install_worktree(
+            candidate.root,
+            traces_enabled=traces_enabled,
+            native_hooks=False,
+            telemetry=machine.get("telemetry_enabled") is True,
+            machine_git_hooks=runs_machine_hooks(candidate.root, machine.get("git_hooks")),
+        )
+    status = installation_status(selected.root)
+    status["warnings"] = list(dict.fromkeys([*status["warnings"], *warnings]))
+    return status
 
 
 def install_repo(
@@ -2252,6 +2428,20 @@ def install_repo(
 
     selected = _repository(repo)
     _validate_install_scope(selected)
+    existing = _load_manifest(selected)
+    if existing is not None and _user_scope(existing) and existing["enabled_worktrees"]:
+        from .user_install import load_user_manifest
+
+        machine = load_user_manifest()
+        if machine is not None and machine["integrations"]:
+            # A clone under machine hooks keeps them. Writing repository hooks
+            # would drop its user scope, and new worktrees could not join.
+            return _reinstall_user_scope(
+                selected,
+                machine,
+                all_worktrees=all_worktrees,
+                traces_enabled=traces_enabled,
+            )
     telemetry_enabled = os.environ.get(_DISABLE_TELEMETRY_ENV) != "1"
     collector_was_running = False
     if telemetry_enabled:
@@ -2573,7 +2763,10 @@ def _uninstall_worktree(repo: str | Path) -> dict[str, Any]:
                 transaction, repository, manifest["exclude"], warnings
             )
             managed_path = str(repository.managed_hooks_path)
-            if local_before == (True, managed_path):
+            if manifest.get("git_hook_scope") == _HOOK_SCOPE_USER:
+                # The machine Git hooks served this clone; it owns no setting.
+                pass
+            elif local_before == (True, managed_path):
                 _restore_local_hooks_path(repository, previous_local)
                 config_restored = True
             else:

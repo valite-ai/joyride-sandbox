@@ -1947,6 +1947,13 @@ def render_user_setup(
         else:
             cost_state = "needs attention"
         _append_field(lines, "Cost collection", cost_state, output_width)
+    git_hooks = _mapping(data.get("git_hooks"))
+    if git_hooks:
+        git_state = _install_state(git_hooks.get("state"))
+        message = safe_text(git_hooks.get("message"))
+        if message and git_hooks.get("state") == "needs-attention":
+            git_state += f" - {message}"
+        _append_field(lines, "Git hooks", git_state, output_width)
     if installed and isinstance(data.get("notice"), str) and data["notice"]:
         _append_field(lines, "Notice", data["notice"], output_width)
     sessions = [

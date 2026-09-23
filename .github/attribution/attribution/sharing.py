@@ -1116,6 +1116,20 @@ def main(argv: list[str] | None = None) -> int:
         if dry_run is None:
             print("Joyride: metadata skipped because the outer push context could not be verified.", file=sys.stderr)
         return 0
+    from .automation import _install_enabled
+
+    # The machine Git hooks run in every clone with a Joyride manifest, and
+    # `joyride uninstall .` keeps that manifest. A clone with a manifest
+    # publishes only from an enabled worktree. A pre-push hook from
+    # scripts/install-pr-footer.py has no manifest and keeps publishing.
+    try:
+        root = repository_root(Path.cwd())
+        if (git_common_dir(root) / "attribution" / "install.json").exists():
+            enabled, _reason = _install_enabled(root)
+            if not enabled:
+                return 0
+    except (OSError, ValueError):
+        return 0
     try:
         return pre_push(Path.cwd(), arguments[1], sys.stdin.read())
     except Exception:

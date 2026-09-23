@@ -30,10 +30,12 @@ class _ArgumentParser(argparse.ArgumentParser):
             ", '_git-hook'",
             ", '_collector'",
             ", '_share'",
+            ", '_repair-hooks'",
             ", _hook",
             ", _git-hook",
             ", _collector",
             ", _share",
+            ", _repair-hooks",
         ):
             message = message.replace(hidden, "")
         super().error(message)
@@ -394,7 +396,9 @@ def parser() -> argparse.ArgumentParser:
     native.add_argument("--repo", dest="hook_repo", type=Path)
     native.add_argument("--repository-hook", action="store_true")
     git_hook = commands.add_parser("_git-hook", add_help=False)
-    git_hook.add_argument("event", choices=("post-commit", "post-merge", "post-rewrite"))
+    git_hook.add_argument(
+        "event", choices=("post-checkout", "post-commit", "post-merge", "post-rewrite")
+    )
     git_hook.add_argument("--repo", dest="hook_repo", type=Path)
     git_hook.add_argument("--summary-fd", type=int)
     collector = commands.add_parser("_collector", add_help=False)
@@ -405,6 +409,7 @@ def parser() -> argparse.ArgumentParser:
     collector.add_argument("--max-request-bytes", type=int, required=True)
     share = commands.add_parser("_share", add_help=False)
     share.add_argument("hook_arguments", nargs=argparse.REMAINDER)
+    commands.add_parser("_repair-hooks", add_help=False)
     return result
 
 
@@ -582,6 +587,11 @@ def main(argv: list[str] | None = None) -> int:
             from .sharing import main as share
 
             return share(args.hook_arguments)
+        if args.action == "_repair-hooks":
+            from .user_install import repair_user_hooks
+
+            repair_user_hooks()
+            return 0
         if args.action == "_collector":
             from .telemetry import _collector_process
 
@@ -1105,7 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         # Hook observers must never block an edit or Git operation, and their
         # generated invocations intentionally produce no output.
-        if args.action in {"_hook", "_git-hook", "_share"} or (
+        if args.action in {"_hook", "_git-hook", "_share", "_repair-hooks"} or (
             args.action == "hook" and getattr(args, "observer", False)
         ):
             return 0

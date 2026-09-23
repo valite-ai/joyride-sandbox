@@ -14,6 +14,9 @@ launcher, so the command text that a tool may have reviewed stays the same.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -21,7 +24,8 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-from typing import Any
+import time
+from typing import Any, Callable, Iterator, TypeVar
 
 from .install import (
     _DISABLE_TELEMETRY_ENV,
@@ -40,27 +44,68 @@ from .install import (
     _remove_native_hooks,
     _runtime,
 )
+from .codex_trust import apply_trust, remove_trust, trust_entries
+from .global_git_hooks import (
+    git_hooks_health,
+    install_git_hooks,
+    stamp_path,
+    uninstall_git_hooks,
+)
 from .runtime import RuntimeCommand
 
 
 _VERSION = 1
-_NOTICE = (
-    "Restart existing coding sessions so they load the machine hooks. "
-    "Review the hooks in Codex when prompted."
-)
+_NOTICE = "Restart existing coding sessions so they load the machine hooks."
 USER_PATHS = {
     "codex": Path(".codex/hooks.json"),
     "claude-code": Path(".claude/settings.json"),
 }
 _LAUNCHER = Path(".attribution/bin/joyride-hook")
+_TRUST_FAILURE = (
+    "Codex does not run the Joyride hooks until you trust them with /hooks "
+    "after the restart. "
+)
 # Process names that identify a coding session. A Node launcher reports the
 # script as its second argument, so both positions are read.
 _AGENT_COMMANDS = {"claude": "Claude Code", "codex": "Codex", "codex.js": "Codex"}
 _NODE_COMMANDS = {"node", "nodejs"}
 
 
+_Result = TypeVar("_Result")
+
+
 def _home() -> Path:
     return Path(os.path.abspath(Path.home()))
+
+
+@contextmanager
+def _machine_lock() -> Iterator[None]:
+    """Hold the machine install lock for one install, uninstall, or repair."""
+
+    path = _home() / ".attribution" / "user-install.lock"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _serialized(function: Callable[[], _Result]) -> Callable[[], _Result]:
+    """Run ``function`` under the machine lock.
+
+    Two Git hooks can repair at the same time. Each one must read the
+    manifest after the other wrote it, or it records ownership of a trust
+    block that is no longer in the file.
+    """
+
+    @functools.wraps(function)
+    def locked() -> _Result:
+        with _machine_lock():
+            return function()
+
+    return locked
 
 
 def user_manifest_path() -> Path:
@@ -255,6 +300,47 @@ def _claude_cost_env(
     }
 
 
+def _watched_paths() -> tuple[Path, Path, Path]:
+    """Return the agent files whose changes make the Git hooks run a repair."""
+
+    codex = _config_path("codex")
+    return _config_path("claude-code"), codex, codex.parent / "config.toml"
+
+
+def _mark_checked() -> None:
+    stamp = stamp_path(_home())
+    stamp.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp.touch()
+    # Some shells compare file times in whole seconds. A stamp two seconds in
+    # the past still catches a settings change made in the same second.
+    checked = time.time() - 2
+    os.utime(stamp, (checked, checked))
+
+
+def _codex_trust(
+    previous: Any, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Record every Joyride Codex hook as reviewed, so Codex runs it at once."""
+
+    hooks_path = _config_path("codex")
+    config_path = hooks_path.parent / "config.toml"
+    previous = previous if isinstance(previous, dict) else {}
+    owned = previous.get("block") if isinstance(previous.get("block"), str) else None
+    created = (
+        previous.get("created_file") is True
+        if "created_file" in previous
+        else not config_path.exists()
+    )
+    entries = trust_entries(hooks_path, payload, _managed_command("codex"))
+    block, message = apply_trust(config_path, hooks_path, entries, owned)
+    return {
+        "config_path": str(config_path),
+        "block": block,
+        "created_file": created,
+        "message": message,
+    }
+
+
 def _codex_warning(codex: Any) -> str | None:
     if not isinstance(codex, dict) or codex.get("enabled") is True:
         return None
@@ -266,6 +352,7 @@ def _codex_warning(codex: Any) -> str | None:
     return "Codex cost collection needs attention." + (f" {detail}" if detail else "")
 
 
+@_serialized
 def install_user_hooks() -> dict[str, Any]:
     """Write the harness hooks once for this machine and every repository."""
 
@@ -349,7 +436,14 @@ def install_user_hooks() -> dict[str, Any]:
         "telemetry_registered": registered,
         "integrations": {},
     }
+    # Carry the Git and trust ownership of an earlier install through every
+    # manifest write. A reinstall that fails part way must still leave an
+    # uninstall that can restore Git and remove the trust block.
+    for key in ("git_hooks", "codex_trust"):
+        if previous is not None and isinstance(previous.get(key), dict):
+            manifest[key] = previous[key]
     prepared: list[tuple[Path, bytes, int]] = []
+    written: dict[str, dict[str, Any]] = {}
     for harness in USER_PATHS:
         path = _config_path(harness)
         merged, raw, mode = loaded[harness]
@@ -389,6 +483,7 @@ def install_user_hooks() -> dict[str, Any]:
             else mode
         )
         desired = _json_bytes(merged)
+        written[harness] = merged
         manifest["integrations"][harness] = entry
         if raw != desired or (raw is not None and mode != desired_mode):
             prepared.append((path, desired, desired_mode))
@@ -399,6 +494,26 @@ def install_user_hooks() -> dict[str, Any]:
     _write(launcher, launcher_bytes, mode=0o755)
     for path, desired, mode in prepared:
         _write(path, desired, mode=mode)
+    # Codex trust is written without a notice, by the product decision to
+    # remove the /hooks review step. Uninstall removes it again.
+    manifest["codex_trust"] = _codex_trust(manifest.get("codex_trust"), written["codex"])
+    _write(user_manifest_path(), _json_bytes(manifest), mode=0o600)
+    if manifest["codex_trust"]["message"]:
+        # A successful trust write stays silent. A failure is reported,
+        # because Codex runs no untrusted hook, so it captures nothing.
+        warnings.append(_TRUST_FAILURE + manifest["codex_trust"]["message"])
+    try:
+        git_record, git_warnings = install_git_hooks(
+            home, launcher, _watched_paths(), manifest.get("git_hooks")
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        git_record, git_warnings = manifest.get("git_hooks"), [
+            f"Machine Git hooks could not be installed: {exc}"
+        ]
+    manifest["git_hooks"] = git_record
+    warnings.extend(git_warnings)
+    _write(user_manifest_path(), _json_bytes(manifest), mode=0o600)
+    _mark_checked()
     status = user_install_status()
     if telemetry_enabled:
         status["telemetry"] = {**telemetry, "claude": user_claude_cost_status()}
@@ -406,13 +521,27 @@ def install_user_hooks() -> dict[str, Any]:
     return status
 
 
+@_serialized
 def uninstall_user_hooks() -> dict[str, Any]:
     """Remove only the machine-level hook commands that this installer wrote."""
 
     manifest = load_user_manifest()
     if manifest is None:
         return user_install_status()
-    warnings: list[str] = []
+    # Restore Git first. If that fails, the error stops the uninstall before
+    # the manifest that records the previous value is gone.
+    warnings: list[str] = list(uninstall_git_hooks(manifest.get("git_hooks")))
+    trust = manifest.get("codex_trust")
+    if isinstance(trust, dict) and isinstance(trust.get("config_path"), str):
+        # Remove the trust block before the OTel block, so that the last one
+        # out can delete a configuration file that Joyride created.
+        warning = remove_trust(
+            Path(trust["config_path"]),
+            trust.get("block") if isinstance(trust.get("block"), str) else None,
+            delete_empty=trust.get("created_file") is True,
+        )
+        if warning:
+            warnings.append(warning)
     for harness in USER_PATHS:
         record = _record(manifest, harness)
         command = record.get("managed_command") if record is not None else None
@@ -463,6 +592,7 @@ def uninstall_user_hooks() -> dict[str, Any]:
     else:
         if _MARKER.encode("utf-8") in raw_launcher:
             launcher.unlink()
+    stamp_path(_home()).unlink(missing_ok=True)
     if telemetry_pending:
         # The hooks are gone, but the machine still owns cost collection. Keep
         # only that ownership, so a later uninstall can finish the cleanup.
@@ -551,6 +681,14 @@ def user_hook_health() -> dict[str, dict[str, Any]]:
             )
         if healthy and runtime_problem is not None:
             healthy, message = False, runtime_problem
+        trust = manifest.get("codex_trust") if manifest is not None else None
+        if (
+            harness == "codex"
+            and healthy
+            and isinstance(trust, dict)
+            and isinstance(trust.get("message"), str)
+        ):
+            healthy, message = False, _TRUST_FAILURE + trust["message"]
         health[harness] = {
             "installed": healthy,
             "state": "enabled" if healthy else "needs-attention",
@@ -598,7 +736,11 @@ def user_install_status() -> dict[str, Any]:
     """Return read-only machine-level installation state."""
 
     harnesses = user_hook_health()
-    return {
+    try:
+        manifest = load_user_manifest()
+    except (OSError, ValueError):
+        manifest = None
+    status: dict[str, Any] = {
         "installed": all(item["installed"] for item in harnesses.values()),
         "scope": "user",
         "manifest_path": str(user_manifest_path()),
@@ -606,6 +748,50 @@ def user_install_status() -> dict[str, Any]:
         "warnings": [],
         "notice": _NOTICE,
     }
+    if manifest is not None:
+        status["git_hooks"] = git_hooks_health(manifest.get("git_hooks"))
+    return status
+
+
+@_serialized
+def repair_user_hooks() -> dict[str, Any]:
+    """Merge back machine hooks and Codex trust that an agent update removed.
+
+    The machine Git hooks call this after an agent settings file changes. It
+    rewrites a file only when the Joyride entries in it are missing or moved.
+    """
+
+    manifest = load_user_manifest()
+    if manifest is None:
+        return {"repaired": []}
+    repaired: list[str] = []
+    payloads: dict[str, dict[str, Any]] = {}
+    for harness in USER_PATHS:
+        record = _record(manifest, harness)
+        command = record.get("managed_command") if record is not None else None
+        path = _config_path(harness)
+        payload, raw, mode, _atime, _mtime = _load_json_config(path)
+        payloads[harness] = payload
+        if not isinstance(command, str):
+            continue
+        healthy, _message = _config_health(path, command, _EVENTS[harness], harness)
+        if healthy:
+            continue
+        try:
+            merged = _merge_native_hooks(payload, command, _EVENTS[harness])
+        except ValueError:
+            continue
+        if merged != payload:
+            _write(path, _json_bytes(merged), mode=mode)
+            payloads[harness] = merged
+            repaired.append(harness)
+    trust = _codex_trust(manifest.get("codex_trust"), payloads["codex"])
+    if trust != manifest.get("codex_trust"):
+        manifest["codex_trust"] = trust
+        _write(user_manifest_path(), _json_bytes(manifest), mode=0o600)
+        repaired.append("codex-trust")
+    _mark_checked()
+    return {"repaired": repaired}
 
 
 def running_agent_sessions(listing: str | None = None) -> list[dict[str, Any]]:
@@ -653,6 +839,7 @@ def running_agent_sessions(listing: str | None = None) -> list[dict[str, Any]]:
 __all__ = [
     "install_user_hooks",
     "launcher_path",
+    "repair_user_hooks",
     "load_user_manifest",
     "machine_telemetry_id",
     "running_agent_sessions",

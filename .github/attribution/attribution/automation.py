@@ -2095,6 +2095,19 @@ def handle_git_hook(repo: RepoPath, event: str = "post-commit") -> dict[str, obj
 
     try:
         root = repository_root(repo)
+        try:
+            from .install import adopt_machine_git_hooks
+
+            # A clone that an earlier machine install set up moves to the
+            # machine Git hooks at its next commit.
+            adopt_machine_git_hooks(root)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        if event == "post-checkout":
+            # A new worktree of a tracked clone joins before its first edit.
+            if _enrolled(root):
+                _heal_worktree(root)
+            return _result("ignored")
         enabled, gate_warning = _install_enabled(root)
         if not enabled:
             return _result("ignored", warnings=[gate_warning] if gate_warning else [])
