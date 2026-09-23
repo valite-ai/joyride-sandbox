@@ -1437,6 +1437,10 @@ def _empty_status(path: Path, *, warning: str | None = None) -> dict[str, Any]:
 def _claude_cost_status(
     repository: _Repository, manifest: dict[str, Any], worktree_id: str
 ) -> dict[str, Any]:
+    if _user_scope(manifest):
+        from .user_install import user_claude_cost_status
+
+        return user_claude_cost_status()
     if manifest.get("telemetry_enabled") is not True:
         return {"enabled": False, "state": "disabled"}
     try:
@@ -1735,20 +1739,27 @@ def installation_status(repo: str | Path) -> dict[str, Any]:
 
 
 def _install_worktree(
-    repo: str | Path, *, traces_enabled: bool | None = None, native_hooks: bool = True
+    repo: str | Path,
+    *,
+    traces_enabled: bool | None = None,
+    native_hooks: bool = True,
+    telemetry: bool | None = None,
 ) -> dict[str, Any]:
     """Idempotently install native and Git automation for one worktree.
 
     ``traces_enabled`` preserves the repository's recorded choice when None.
     ``native_hooks`` is false when machine-level hooks already run. That
     worktree receives its Git publisher and a manifest with the user scope.
+    ``telemetry`` defaults to ``native_hooks``; the machine install passes its
+    own choice so that the clone registers sessions for cost matching.
     """
 
     repository = _repository(repo)
     _validate_install_scope(repository)
     runtime = _runtime()
     telemetry_enabled = (
-        native_hooks and os.environ.get(_DISABLE_TELEMETRY_ENV) != "1"
+        (native_hooks if telemetry is None else telemetry)
+        and os.environ.get(_DISABLE_TELEMETRY_ENV) != "1"
     )
     worktree_id = str(repository.git_dir)
     manifest = _load_manifest(repository)
@@ -1954,6 +1965,7 @@ def _install_worktree(
         repository, manifest, first_active_install=not active
     )
 
+    claude_telemetry: dict[str, str] = {}
     if telemetry_enabled:
         from .telemetry import ensure_collector
         from .telemetry_setup import claude_telemetry_env
@@ -1961,10 +1973,14 @@ def _install_worktree(
         # Start only after every repository, hook, native config, backup, and
         # exclude target has passed its read-only preflight.  Read settings
         # after startup because an occupied default port can select a new one.
-        ensure_collector()
-        claude_telemetry = claude_telemetry_env()
-    else:
-        claude_telemetry = {}
+        try:
+            ensure_collector()
+            # A clone under machine hooks writes no Claude settings of its own.
+            claude_telemetry = claude_telemetry_env() if native_hooks else {}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Cost collection is optional. A collector that cannot start loses
+            # cost data only; status reports the missing Claude settings.
+            claude_telemetry = {}
 
     prepared_integrations: list[
         tuple[dict[str, Any], Path, bytes, bytes | None, int, int]
@@ -2202,7 +2218,11 @@ def heal_worktree(repo: str | Path) -> bool:
 
     from .user_install import load_user_manifest
 
-    if load_user_manifest() is None:
+    machine = load_user_manifest()
+    # A manifest with no integrations only owns a telemetry cleanup that an
+    # earlier uninstall could not finish. No machine hook runs, so it enrolls
+    # nothing.
+    if machine is None or not machine["integrations"]:
         return False
     repository = _repository(repo)
     manifest = _load_manifest(repository)
@@ -2212,7 +2232,11 @@ def heal_worktree(repo: str | Path) -> bool:
         or str(repository.git_dir) in manifest["enabled_worktrees"]
     ):
         return False
-    _install_worktree(repository.root, native_hooks=False)
+    _install_worktree(
+        repository.root,
+        native_hooks=False,
+        telemetry=machine.get("telemetry_enabled") is True,
+    )
     return True
 
 

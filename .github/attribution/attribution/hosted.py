@@ -353,8 +353,9 @@ def make_setup_plan(
         "out or execute pull-request source.\n\n"
         f"{variable_note}\n\n"
         "Review the generated workflow and runtime before merging. Each developer "
-        "clone still needs `joyride install .` so its ordinary pushes publish the "
-        "bounded local attribution metadata used by the workflow."
+        "still needs `joyride install --user` once per machine so that the ordinary "
+        "pushes of each clone publish the bounded local attribution metadata used by "
+        "the workflow."
     )
     return HostedSetupPlan(repository, selected_branch, selected_base, files, normalised_url, title, body)
 
@@ -1059,7 +1060,7 @@ def doctor(
         checks.append({
             "name": "local_installation",
             "state": "warn",
-            "message": "Local hooks are not healthy; run `joyride install .` in each developer clone.",
+            "message": "Local hooks are not healthy; run `joyride install --user` once on each developer machine.",
         })
     ready = all(item["state"] in {"pass", "warn"} for item in checks) and not any(
         item["state"] == "fail" for item in checks

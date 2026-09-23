@@ -11,13 +11,13 @@ from __future__ import annotations
 INSTALL_SOURCE = "git+https://github.com/valite-ai/attribution-hosted"
 HOSTED_URL = "<HOSTED_URL>"
 
-DEVELOPER_PROMPT = """Set up Joyride local capture in this repository. Joyride records which coding agent sessions shaped a change and what they cost. Work from the repository root and follow these steps in order. Stop and report if any step fails.
+DEVELOPER_PROMPT = """Set up Joyride local capture on this machine. Joyride records which coding agent sessions shaped a change and what they cost. Work from the repository root and follow these steps in order. Stop and report if any step fails.
 
 1. Run `git status --short`. Do not commit anything during this task.
 2. Install the Joyride CLI once for this machine. Prefer uv: run `uv tool install <INSTALL_SOURCE>`. If uv is missing but pipx exists, run `pipx install <INSTALL_SOURCE>`. If neither exists, stop and tell me to install uv from https://docs.astral.sh/uv/. Do not use `uvx`, because the hooks need an installation that persists.
 3. Make sure that `joyride --version` prints a version. If the command is not on PATH, run `uv tool update-shell`, tell me to open a new shell, and stop.
-4. Run `joyride install .` from the repository root. This writes hook entries for Claude Code and Codex into untracked local files, adds a Git pre-push hook that publishes bounded metadata, and starts a local collector on the loopback interface. The install itself sends nothing. Each later push publishes that metadata with a redacted, capped trace of each session, which holds prompts, replies, and tool activity. Add `--no-traces` to the install command to keep and publish no trace.
-5. Run `joyride status` and show me the result.
+4. Run `joyride install --user`. This writes hook entries for Claude Code and Codex into the user-level agent configuration, so they apply to every repository on this machine. It also writes cost collection settings and starts a local collector on the loopback interface. The install itself sends nothing. A clone that contains the Joyride workflow finishes its own setup at the first hook event and adds a Git pre-push hook that publishes bounded metadata. Each later push publishes that metadata with a redacted, capped trace of each session, which holds prompts, replies, and tool activity. To keep and publish no trace in this repository, also run `joyride install . --no-traces`.
+5. Run `joyride self-test` and show me the result.
 6. List every file that the install created or changed. Make sure that `git status --short` shows no new tracked changes.
 7. Finish with this exact instruction, because hooks load only when a session starts: "Restart this session now. If you are in Codex, run /hooks after the restart and trust the Joyride hook definitions." Then stop."""
 

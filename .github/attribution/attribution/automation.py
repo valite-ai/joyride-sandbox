@@ -1946,7 +1946,17 @@ def _register_telemetry_session(
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return
-    if not isinstance(state, dict) or state.get("telemetry_enabled") is not True:
+    if not isinstance(state, dict):
+        return
+    enabled = state.get("telemetry_enabled") is True
+    if state.get("hook_scope") == "user":
+        # A clone under machine hooks follows the machine's cost choice, which
+        # a later `joyride install --user` can turn on after it enrolled.
+        from .user_install import load_user_manifest
+
+        machine = load_user_manifest()
+        enabled = machine is not None and machine.get("telemetry_enabled") is True
+    if not enabled:
         return
     from .telemetry import ensure_collector, register_session
 

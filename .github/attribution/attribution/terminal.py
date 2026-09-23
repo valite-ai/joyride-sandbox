@@ -1842,8 +1842,8 @@ def render_status(
     elif status.get("installed") is False and status.get("git_repository") is True:
         enable = (
             "joyride install --user"
-            if user_scope and user_scope.get("installed") is not True
-            else "joyride install ."
+            if user_scope.get("installed") is not True
+            else "starts at the next hook event once this clone has the Joyride workflow"
         )
         _append_field(lines, "Enable", enable, output_width)
     installation_warnings = _items(status.get("warnings"))
@@ -1933,8 +1933,38 @@ def render_user_setup(
         if message and harness.get("state") == "needs-attention":
             harness_state += f" - {message}"
         _append_field(lines, label, harness_state, output_width)
+    telemetry = _mapping(data.get("telemetry"))
+    if installed and telemetry:
+        costs = [
+            (label, _mapping(telemetry.get(key)))
+            for key, label in (("claude", "Claude"), ("codex", "Codex"))
+        ]
+        enabled = [label for label, item in costs if item.get("enabled") is True]
+        if len(enabled) == len(costs):
+            cost_state = "enabled for Claude and Codex"
+        elif enabled:
+            cost_state = f"enabled for {enabled[0]} only"
+        else:
+            cost_state = "needs attention"
+        _append_field(lines, "Cost collection", cost_state, output_width)
     if installed and isinstance(data.get("notice"), str) and data["notice"]:
         _append_field(lines, "Notice", data["notice"], output_width)
+    sessions = [
+        _mapping(item) for item in _items(data.get("restart_sessions"))
+    ]
+    named = [
+        f"{safe_text(item.get('name'))} (PID {item['pid']})"
+        for item in sessions
+        if safe_text(item.get("name")) and _integer(item.get("pid")) is not None
+    ]
+    if installed and named:
+        _append_wrapped(
+            lines,
+            "Restart these sessions so they load the hooks: "
+            + ", ".join(named)
+            + ". Work done before a restart is not captured.",
+            output_width,
+        )
     if installed:
         _append_wrapped(
             lines,

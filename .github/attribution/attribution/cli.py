@@ -605,9 +605,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--code needs --hosted-url or ATTRIBUTION_HOSTED_URL.")
             if args.user:
                 from .terminal import render_user_setup
-                from .user_install import install_user_hooks
+                from .user_install import install_user_hooks, running_agent_sessions
 
-                _emit(render_user_setup(install_user_hooks(), installed=True))
+                status = install_user_hooks()
+                status["restart_sessions"] = running_agent_sessions()
+                _emit(render_user_setup(status, installed=True))
                 _report_install(hosted_url, args.code)
                 return 0
             from .install import install_repo
@@ -922,9 +924,14 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     from .store import git_common_dir
                     from .telemetry_setup import telemetry_install_status
+                    from .user_install import machine_telemetry_id
 
+                    # A clone under machine hooks shares the machine's Codex
+                    # registration instead of holding its own.
                     machine_telemetry = telemetry_install_status(
-                        str(git_common_dir(selected))
+                        machine_telemetry_id()
+                        if installation.get("hook_scope") == "user"
+                        else str(git_common_dir(selected))
                     )
                     existing_telemetry = installation.get("telemetry")
                     installation["telemetry"] = {
