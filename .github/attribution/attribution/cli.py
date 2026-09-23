@@ -549,14 +549,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.action == "_hook":
-            from .automation import handle_hook
+            from .hook_service import run_native_hook
 
             payload = _read_hook_payload()
-            if args.repository_hook:
-                from .user_install import user_hook_covers
-
-                if user_hook_covers(args.harness, payload.get("hook_event_name")):
-                    return 0
             payload_cwd = payload.get("cwd")
             selected_hook_repo = (
                 args.hook_repo
@@ -566,7 +561,9 @@ def main(argv: list[str] | None = None) -> int:
                     else args.repo
                 )
             )
-            handle_hook(selected_hook_repo, payload, args.harness)
+            run_native_hook(
+                args.harness, payload, selected_hook_repo, args.repository_hook
+            )
             return 0
         if args.action == "_git-hook":
             from .automation import handle_git_hook

@@ -109,7 +109,16 @@ def _stable_executable(runtime: RuntimeCommand) -> Path:
 
 
 def _launcher_bytes(runtime: RuntimeCommand, executable: Path) -> bytes:
-    invocation = runtime.cli(())
+    # A Python runtime starts the thin hook client, which hands each hook
+    # event to the local collector and serves every other command through the
+    # CLI. A standalone build keeps its single entry point.
+    invocation = (
+        runtime.cli(())
+        if runtime.standalone
+        else runtime.module_child(
+            "attribution.hook_client", (), standalone_action="_hook"
+        )
+    )
     arguments = (str(executable), *invocation.argv[1:])
     lines = [
         "#!/bin/sh",

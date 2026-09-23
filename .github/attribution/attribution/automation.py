@@ -24,6 +24,7 @@ from .capture import (
     _utc_now,
     _worktree_lock,
 )
+from .hook_client import clock
 from .hosted_runtime import WORKFLOW_PATH
 from .notes import _record_commit_locked
 from .runtime import system_subprocess_environment
@@ -843,6 +844,7 @@ def _handle_pre(
     payload: Mapping[str, Any],
     harness: str,
     native_session_id: str,
+    deadline: float | None = None,
 ) -> dict[str, object]:
     tool_use_id = _required_text(payload, "tool_use_id")
     worktree_id = str(git_dir(repo))
@@ -881,6 +883,11 @@ def _handle_pre(
                 )
             started_at = _utc_now()
             base_commit = _base_commit(repo)
+            if deadline is not None and clock() > deadline:
+                # The tool may have started while the worktree was read, so
+                # this snapshot could hold its edits as the before state. The
+                # completion then records the call without file evidence.
+                return _result("expired")
             model, model_source, feature, feature_source = _session_context(
                 connection,
                 repo,
@@ -1971,8 +1978,18 @@ def _register_telemetry_session(
     )
 
 
-def handle_hook(repo: RepoPath, payload: Mapping[str, Any], harness: str) -> dict[str, object]:
-    """Handle one Codex or Claude Code JSON hook event without policy output."""
+def handle_hook(
+    repo: RepoPath,
+    payload: Mapping[str, Any],
+    harness: str,
+    *,
+    deadline: float | None = None,
+) -> dict[str, object]:
+    """Handle one Codex or Claude Code JSON hook event without policy output.
+
+    ``deadline`` is a ``hook_client.clock`` value after which the coding tool may
+    already run. A ``PreToolUse`` that reads its baseline later records none.
+    """
 
     try:
         if (
@@ -2011,7 +2028,7 @@ def handle_hook(repo: RepoPath, payload: Mapping[str, Any], harness: str) -> dic
                 # A tool that changes no file needs no baseline. Its row is
                 # inserted when it completes, which costs no snapshot.
                 return _handle_fast_pre(root, payload, harness, native_session_id)
-            return _handle_pre(root, payload, harness, native_session_id)
+            return _handle_pre(root, payload, harness, native_session_id, deadline)
         if event in {"PostToolUse", "PostToolUseFailure"}:
             return _handle_post(root, payload, harness, native_session_id, event)
         if event in {"SessionStart", "PostModelSwitch"}:

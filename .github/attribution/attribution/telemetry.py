@@ -49,12 +49,15 @@ import stat
 import subprocess
 import threading
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .runtime import current_runtime
+
+if TYPE_CHECKING:
+    from .hook_service import HookEndpoint
 
 
 STATE_DIR_ENV = "ATTRIBUTION_TELEMETRY_DIR"
@@ -63,6 +66,7 @@ DEFAULT_MAX_REQUEST_BYTES = 1_048_576
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
 _COLLECTOR_IDENTITY = "harness-attribution-telemetry-v1"
 _COLLECTOR_LOCK_FILENAME = "collector-startup.lock"
+_ORPHAN_CHECK_SECONDS = 1.0
 _MAX_IDENTITY_RESPONSE_BYTES = 4096
 CODEX_CHATGPT_CREDIT_RATES_EFFECTIVE_DATE = "2026-09-14"
 OPENAI_API_STANDARD_RATES_EFFECTIVE_DATE = "2026-09-14"
@@ -1471,8 +1475,13 @@ def make_handler(
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     *,
     instance_id: str | None = None,
+    hooks: HookEndpoint | None = None,
 ) -> type[BaseHTTPRequestHandler]:
-    """Build an authenticated handler for ``/v1/logs`` and ``/health``."""
+    """Build an authenticated handler for ``/v1/logs`` and ``/health``.
+
+    With ``hooks``, the handler also runs native hook events that the thin
+    hook client sends to ``/v1/hook``.
+    """
 
     token = _bounded_text(bearer_token, 4096)
     if token is None:
@@ -1549,7 +1558,10 @@ def make_handler(
                 return
             if self.path == "/shutdown":
                 self._json(200, {"status": "stopping"})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                _stop_in_background(self.server, hooks)
+                return
+            if self.path == "/v1/hook" and hooks is not None:
+                self._hook()
                 return
             if self.path != "/v1/logs":
                 self._json(404, {"error": "not_found"})
@@ -1587,7 +1599,50 @@ def make_handler(
                 return
             self._json(200, result)
 
+        def _hook(self) -> None:
+            from .hook_service import MAX_HOOK_REQUEST_BYTES
+
+            assert hooks is not None
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                self._json(411, {"error": "content_length_required"})
+                return
+            if length < 0 or length > MAX_HOOK_REQUEST_BYTES:
+                self._json(413, {"error": "request_too_large"})
+                return
+            body = self.rfile.read(length)
+            if len(body) != length:
+                self._json(400, {"error": "incomplete_request_body"})
+                return
+            status, answer, stop = hooks.handle(body)
+            self._json(status, answer)
+            if stop:
+                _stop_in_background(self.server, hooks)
+
     return TelemetryHandler
+
+
+def _stop_server(server: ThreadingHTTPServer, hooks: HookEndpoint | None) -> None:
+    """Stop the server after every hook event that it accepted has run.
+
+    A client received a receipt for each accepted event, so nobody else runs
+    it. The server therefore waits for all of them, however long that takes.
+    It keeps answering meanwhile: an event for a worktree with unfinished
+    events joins that queue, and the client of any other worktree runs its
+    event itself. The hook code holds each lock only briefly, so the wait
+    ends when the queued work does.
+    """
+
+    if hooks is not None:
+        hooks.dispatcher.drain()
+    server.shutdown()
+
+
+def _stop_in_background(server: ThreadingHTTPServer, hooks: HookEndpoint | None) -> None:
+    # ``shutdown`` waits for the serve loop, so it never runs on a thread
+    # that the loop is waiting for.
+    threading.Thread(target=_stop_server, args=(server, hooks), daemon=True).start()
 
 
 class _LoopbackThreadingHTTPServer(ThreadingHTTPServer):
@@ -1603,6 +1658,7 @@ def make_server(
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     *,
     instance_id: str | None = None,
+    hooks: HookEndpoint | None = None,
 ) -> ThreadingHTTPServer:
     """Create, but do not start, a loopback-only OTLP HTTP server."""
 
@@ -1617,6 +1673,7 @@ def make_server(
         bearer_token,
         max_request_bytes,
         instance_id=selected_instance_id,
+        hooks=hooks,
     )
     address: tuple[Any, ...] = (loopback, port)
     if ":" in loopback:
@@ -2080,10 +2137,14 @@ def _collector_process(
     port: int,
     max_request_bytes: int,
 ) -> int:
+    from .hook_client import environment_key, runtime_identity
+    from .hook_service import HookEndpoint
+
     directory = secure_state_dir(state_dir)
     token = _load_or_create_token(directory)
     store = TelemetryStore(directory)
     instance_id = secrets.token_hex(16)
+    hooks = HookEndpoint(runtime_identity(), environment_key())
     server = make_server(
         store,
         token,
@@ -2091,6 +2152,7 @@ def _collector_process(
         port,
         max_request_bytes,
         instance_id=instance_id,
+        hooks=hooks,
     )
     bound_host = str(server.server_address[0])
     bound_port = int(server.server_address[1])
@@ -2104,14 +2166,33 @@ def _collector_process(
     _write_runtime(directory, runtime)
 
     def request_shutdown(_signum: int, _frame: Any) -> None:
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        _stop_in_background(server, hooks)
 
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
+    next_check = time.monotonic() + _ORPHAN_CHECK_SECONDS
+
+    def stop_when_orphaned() -> None:
+        # A collector whose state directory was deleted, or whose runtime
+        # record now names another collector, can no longer be found or
+        # stopped. It stops itself instead of running until reboot.
+        nonlocal next_check
+        if time.monotonic() < next_check:
+            return
+        next_check = time.monotonic() + _ORPHAN_CHECK_SECONDS
+        current = _read_runtime(directory)
+        if current is None or current.get("instance_id") != instance_id:
+            request_shutdown(signal.SIGTERM, None)
+            next_check = math.inf
+
+    server.service_actions = stop_when_orphaned  # type: ignore[method-assign]
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
         server.server_close()
+        # Worker threads end with the process, so no accepted event may still
+        # be queued or running when this function returns.
+        hooks.dispatcher.drain()
         current = _read_runtime(directory)
         if current and current.get("instance_id") == instance_id:
             try:

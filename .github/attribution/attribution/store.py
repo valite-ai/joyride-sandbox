@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
-from typing import Union
+from typing import Iterator, Union
 
 from .runtime import system_subprocess_environment
 
@@ -393,6 +395,25 @@ def _run_git(repo: RepoPath, *args: str) -> subprocess.CompletedProcess[bytes]:
 
 
 _git_path_cache: dict[tuple[str, str], Path] = {}
+_git_path_scope: ContextVar[dict[tuple[str, str], Path] | None] = ContextVar(
+    "attribution_git_path_scope", default=None
+)
+
+
+@contextmanager
+def git_path_scope() -> Iterator[None]:
+    """Cache Git paths only for the work inside this block.
+
+    A short CLI process may keep its paths for its whole life. A long-lived
+    process uses one scope for each unit of work, because a worktree can move
+    and another can take its old path between two units.
+    """
+
+    token = _git_path_scope.set({})
+    try:
+        yield
+    finally:
+        _git_path_scope.reset(token)
 
 
 def _git_path(repo: RepoPath, flag: str) -> Path:
@@ -402,13 +423,15 @@ def _git_path(repo: RepoPath, flag: str) -> Path:
     query costs a Git subprocess. A cached path is reused while it exists.
     """
 
+    scoped = _git_path_scope.get()
+    cache = _git_path_cache if scoped is None else scoped
     key = (os.path.abspath(repo), flag)
-    cached = _git_path_cache.get(key)
+    cached = cache.get(key)
     if cached is not None and cached.exists():
         return cached
     output = _run_git(repo, "rev-parse", "--path-format=absolute", flag).stdout
     path = Path(output.decode("utf-8", errors="surrogateescape").strip()).resolve()
-    _git_path_cache[key] = path
+    cache[key] = path
     return path
 
 
