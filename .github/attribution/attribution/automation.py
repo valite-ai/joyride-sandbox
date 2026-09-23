@@ -2235,6 +2235,40 @@ def _base_arrival(root: Path, commit_sha: str, parent: str | None) -> str | None
     return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _name_models_from_telemetry(root: Path, sessions: Mapping[str, dict[str, Any]]) -> None:
+    """Label a session whose harness named no model with its telemetry model.
+
+    A ``claude -p`` session reports no model to any hook, so its note says
+    ``unknown``, while the local spool of the same run names the model of each
+    request. The line prints the label that the report and the footer print.
+    The note keeps what the harness reported.
+
+    Usage is allocated across every session of the ledger, as the report does,
+    because a subagent's request that finds no session of its own would fall to
+    its parent and lend it the subagent's model.
+    """
+
+    from .report import _Warnings, _load_local_sessions, _model_unknown, telemetry_model
+
+    unnamed = [session for session in sessions.values() if _model_unknown(session)]
+    if not unnamed:
+        return
+    try:
+        from . import costing
+
+        common = git_common_dir(root)
+        ledger = {session["id"]: session for session in _load_local_sessions(common, _Warnings())}
+        for session in sessions.values():
+            ledger.setdefault(session["id"], session)
+        usage = costing.allocate_session_usage(common, ledger.values())
+    except (OSError, ValueError, sqlite3.Error):
+        return
+    for session in unnamed:
+        named = telemetry_model(session, usage.get(session["id"]))
+        if named is not None:
+            session["model"] = named
+
+
 def _commit_summary(root: Path, worktree_id: str, commit_sha: str) -> list[str]:
     """Return at most two lines that prove what the commit's note recorded."""
 
@@ -2279,6 +2313,7 @@ def _commit_summary(root: Path, worktree_id: str, commit_sha: str) -> list[str]:
         for session in note.get("sessions", [])
         if isinstance(session, dict) and isinstance(session.get("id"), str)
     }
+    _name_models_from_telemetry(root, sessions)
     added = 0
     by_agent: dict[str, int] = {}
     for file_record in note.get("files", []):
