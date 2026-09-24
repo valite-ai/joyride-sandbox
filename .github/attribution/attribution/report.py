@@ -13,6 +13,7 @@ import re
 import sqlite3
 import statistics
 import subprocess
+import threading
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
@@ -303,6 +304,10 @@ _SESSION_SOURCE_VALUES = {
         "harness",
         "native_hook",
         "agent_response",
+        # A hook named the model: Claude's selected session setting, or the
+        # model field of any other harness's event.
+        "session_setting",
+        "hook",
         # A label a report derived from the models its telemetry named. It is
         # never written to the ledger or to a note; only a report carries it.
         "telemetry",
@@ -1629,11 +1634,58 @@ def _target_blame(
         entries = entries[:_MAX_TARGET_FILES]
         complete = False
 
+    # A binary file holds no attributed lines, so skipping one, however large,
+    # leaves retention complete. Git calls a file binary when its first 8,000
+    # bytes hold a NUL byte, and one stream reads every large file for that.
+    binary: set[str] = set()
+    large = [
+        (path, object_id)
+        for path, object_id, size, _mode in entries
+        if size > _MAX_TARGET_FILE_BYTES
+    ]
+    if large:
+        process = subprocess.Popen(
+            ["git", "-C", str(repo), "cat-file", "--batch"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=system_subprocess_environment(),
+        )
+        timer = threading.Timer(_GIT_TIMEOUT_SECONDS, process.kill)
+        timer.start()
+        try:
+            for path, object_id in large:
+                process.stdin.write(object_id.encode("ascii") + b"\n")
+                process.stdin.flush()
+                header = process.stdout.readline().split()
+                if len(header) != 3:
+                    break
+                head = process.stdout.read(8000)
+                # The rest of the blob and its newline keep the stream in step.
+                remaining = int(header[2]) + 1 - len(head)
+                while remaining > 0:
+                    chunk = process.stdout.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                if b"\x00" in head:
+                    binary.add(path)
+        except (OSError, ValueError):
+            # A file left unread counts as text, so retention stays unavailable.
+            pass
+        finally:
+            timer.cancel()
+            process.kill()
+            process.communicate()
+
     origins: set[_Origin] = set()
     inspected_bytes = 0
     for path, object_id, size, _mode in entries:
         display_path = path.encode("utf-8", errors="replace").decode("utf-8")
         if size > _MAX_TARGET_FILE_BYTES:
+            if path in binary:
+                warnings.add(f"Skipped binary target file {display_path!r}.")
+                continue
             warnings.add(
                 f"Skipped large target file {display_path!r}; retention metrics are unavailable."
             )

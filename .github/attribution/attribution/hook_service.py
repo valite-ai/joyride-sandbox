@@ -66,6 +66,16 @@ def run_native_hook(
             if user_hook_covers(harness, payload.get("hook_event_name")):
                 return
         handle_hook(Path(repo), payload, harness, deadline=deadline)
+        if not repository_hook and payload.get("hook_event_name") == "SessionStart":
+            # A running session keeps the hook commands it started with, so a
+            # healed repository hook stops doubling from the next session on.
+            try:
+                from .install import mark_repository_hooks
+
+                mark_repository_hooks(Path(repo), harness)
+            except Exception:
+                # Healing is best effort. A hook never fails because of it.
+                pass
 
 
 @dataclass

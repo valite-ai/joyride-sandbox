@@ -2608,6 +2608,74 @@ def heal_worktree(repo: str | Path) -> bool:
     return True
 
 
+def mark_repository_hooks(repo: str | Path, harness: str) -> bool:
+    """Add ``--repository-hook`` to one worktree's older repository hook.
+
+    A repository hook written before the flag existed cannot defer to the
+    machine hook, so every session that loads it records each event twice. Its
+    command is rewritten only where the manifest records it as Joyride's own and
+    the repository runs this runtime, which reads the flag. Returns whether the
+    hook file changed.
+    """
+
+    from .user_install import _machine_lock, user_hook_covers
+
+    repository = _repository(repo)
+    worktree_id = str(repository.git_dir)
+    manifest = _load_manifest(repository)
+    record = _integration_record(manifest, worktree_id, harness) if manifest else None
+    if (
+        record is None
+        or not isinstance(record.get("managed_command"), str)
+        or "--repository-hook" in record["managed_command"]
+        or not user_hook_covers(harness, "SessionStart")
+    ):
+        return False
+    runtime = _runtime()
+    command = _managed_command(repository, harness, runtime)
+    legacy = command.replace(" --repository-hook", "")
+    path = repository.root / _INTEGRATION_PATHS[harness]
+    # The machine lock comes first, as in machine installs, then the
+    # repository's install lock, so installs and this rewrite never interleave.
+    with _machine_lock(), _install_lock(repository):
+        # Another hook may have healed the file while this one waited.
+        manifest = _load_manifest(repository)
+        record = _integration_record(manifest, worktree_id, harness) if manifest else None
+        if (
+            record is None
+            or record.get("managed_command") != legacy
+            or record.get("path") != str(path)
+            or _manifest_runtime(manifest) != runtime
+        ):
+            return False
+        _assert_native_target(path, repository.root)
+        payload, raw, mode, _atime, _mtime = _load_json_config(path)
+        if raw is None:
+            return False
+        handlers = [
+            handler
+            for *_position, handler in _iter_hook_commands(payload)
+            if handler["command"] == legacy
+        ]
+        if not handlers:
+            return False
+        for handler in handlers:
+            handler["command"] = command
+        desired = _json_bytes(payload)
+        _atomic_write(path, desired, mode=mode)
+        # As a reinstall does, a file someone changed after the install keeps
+        # its content on uninstall instead of its preimage.
+        if record.get("installed_sha256") != _sha256(raw) or record.get(
+            "installed_mode", mode
+        ) != mode:
+            record["restore_preimage_when_unchanged"] = False
+        record["managed_command"] = command
+        record["installed_sha256"] = _sha256(desired)
+        record["installed_mode"] = mode
+        _atomic_write(repository.manifest_path, _manifest_bytes(manifest), mode=0o600)
+    return True
+
+
 @_serialized
 def adopt_machine_git_hooks(repo: str | Path) -> bool:
     """Move a clone from its own Git hook dispatcher to the machine Git hooks.

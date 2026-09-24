@@ -561,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.action == "_hook":
             from .hook_service import run_native_hook
+            from .store import git_common_dir
 
             payload = _read_hook_payload()
             payload_cwd = payload.get("cwd")
@@ -572,9 +573,16 @@ def main(argv: list[str] | None = None) -> int:
                     else args.repo
                 )
             )
-            run_native_hook(
-                args.harness, payload, selected_hook_repo, args.repository_hook
+            # A repository hook written before ``--repository-hook`` existed
+            # starts through this repository's bootstrap, which the machine
+            # hook never uses. It defers exactly like a flagged one.
+            launcher = Path(sys.argv[0])
+            repository_hook = args.repository_hook or (
+                launcher.name == "hook-bootstrap.py"
+                and launcher.resolve()
+                == (git_common_dir(selected_hook_repo) / "attribution" / launcher.name).resolve()
             )
+            run_native_hook(args.harness, payload, selected_hook_repo, repository_hook)
             return 0
         if args.action == "_git-hook":
             from .automation import handle_git_hook
