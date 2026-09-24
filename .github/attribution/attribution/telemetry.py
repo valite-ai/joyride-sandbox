@@ -109,6 +109,9 @@ CODEX_CHATGPT_CREDIT_RATES: dict[str, dict[str, Decimal]] = {
 }
 OPENAI_API_STANDARD_RATES: dict[str, dict[str, Decimal]] = {
     "gpt-6-astra": {"input": Decimal("10"), "cached_input": Decimal("1"), "output": Decimal("50")},
+    # Read from the OpenAI API pricing page on 2026-09-23. No Codex credit
+    # rate was read for this model, so subscription turns stay unpriced.
+    "gpt-6-luna": {"input": Decimal("0.1"), "cached_input": Decimal("0.01"), "output": Decimal("0.5")},
     "gpt-5.6-sol": {"input": Decimal("4"), "cached_input": Decimal("0.4"), "output": Decimal("20")},
     "gpt-5.6-terra": {"input": Decimal("2"), "cached_input": Decimal("0.2"), "output": Decimal("12")},
     "gpt-5.6-luna": {"input": Decimal("0.2"), "cached_input": Decimal("0.02"), "output": Decimal("1.2")},
@@ -878,6 +881,7 @@ def _api_service_tier_multiplier(
         return Decimal("2.5")
     if model in {
         "gpt-6-astra",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -922,7 +926,13 @@ def compute_openai_api_usd(
     cache_write_multiplier = (
         Decimal("1.25")
         if model_name
-        in {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+        in {
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        }
         else Decimal("1")
     )
     return multiplier * (
