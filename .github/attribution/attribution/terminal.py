@@ -13,6 +13,7 @@ import sys
 import unicodedata
 from typing import Any
 
+from .cost_reasons import describe, is_proxy_priced
 from .workflow import iter_agents
 
 
@@ -195,12 +196,37 @@ def _feature_cost(feature: Mapping[str, Any], *, compact: bool) -> str:
         else:
             suffix = "" if compact else " reported"
         result = f"${usd:,.2f}{suffix}"
-    return f"{result}*" if incomplete and compact else (
+    text = f"{result}*" if incomplete and compact else (
         f"{result} (partial)" if incomplete else result
     )
+    if feature.get("proxy_price") is True:
+        text += " proxy" if compact else " (proxy price)"
+    return text
 
 
 def _session_cost(session: Mapping[str, Any]) -> str:
+    text = _session_amount(session)
+    # A reported cost is the counted one, so telemetry notes do not apply.
+    telemetry = (
+        _mapping(session.get("telemetry")) if _number(session.get("cost_usd")) is None else {}
+    )
+    if text != "unknown" and (
+        telemetry.get("proxy_price") is True or is_proxy_priced(telemetry.get("sources"))
+    ):
+        text += " (proxy price)"
+    return text
+
+
+def _session_unknown_cost(session: Mapping[str, Any]) -> str | None:
+    """Say why part of one session's cost is unknown, or None."""
+    if _number(session.get("cost_usd")) is not None:
+        return None
+    return describe(
+        _mapping(session.get("telemetry")).get("unpriced_reasons"), escape=safe_text
+    )
+
+
+def _session_amount(session: Mapping[str, Any]) -> str:
     reported = _number(session.get("cost_usd"))
     telemetry = _mapping(session.get("telemetry"))
     estimated = _number(telemetry.get("estimated_cost_usd"))
@@ -1002,6 +1028,12 @@ def render_report(
                 "cr = estimated credits. ≈$ is standard API pricing, not subscription spend.",
                 output_width,
             )
+        if any(feature.get("proxy_price") is True for feature in visible_features):
+            _append_wrapped(
+                lines,
+                "proxy = priced at a stand-in model's published rate, because this model has none.",
+                output_width,
+            )
         if any(
             _feature_cost(_mapping(item), compact=True) != "unknown"
             and not item.get("cost_complete", False)
@@ -1154,6 +1186,9 @@ def _render_sessions(feature: Mapping[str, Any], width: int, *, target_exists: b
             indent="    ",
         )
         _append_field(lines, "Cost", _session_cost(session), width, indent="    ")
+        unknown = _session_unknown_cost(session)
+        if unknown:
+            _append_field(lines, "Unknown cost", unknown, width, indent="    ")
         _append_field(lines, "Tokens", _count(session.get("token_count")), width, indent="    ")
         parent = safe_text(session.get("parent_session_id"))
         if parent:
@@ -1453,6 +1488,13 @@ def render_feature(
         _feature_cost(feature, compact=False),
         output_width,
     )
+    unknown = describe(
+        feature.get("unpriced_reasons"),
+        _integer(feature.get("sessions_without_usage")) or 0,
+        escape=safe_text,
+    )
+    if unknown:
+        _append_field(lines, "Unknown cost", unknown, output_width)
     token_text = _count(feature.get("total_tokens"))
     if feature.get("tokens_complete") is False and token_text != "unknown":
         token_text += " (incomplete)"
@@ -1599,6 +1641,9 @@ def _render_owner(owner: Mapping[str, Any], width: int) -> list[str]:
     if parent:
         _append_field(lines, "Parent session", parent, width, indent="    ")
     _append_field(lines, "Cost", _session_cost(session), width, indent="    ")
+    unknown = _session_unknown_cost(session)
+    if unknown:
+        _append_field(lines, "Unknown cost", unknown, width, indent="    ")
     _append_field(
         lines,
         "Commit",

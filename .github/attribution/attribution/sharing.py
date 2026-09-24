@@ -11,6 +11,7 @@ import subprocess
 import sys
 from typing import Any, TextIO
 
+from .cost_reasons import is_proxy_priced, sanitize_reasons
 from .notes import (
     NOTES_REF, _blob_content, _changed_files, _eligible_edits, _exact_chain,
     _tree, record_commit,
@@ -558,7 +559,9 @@ def _usage_model(value: Any) -> str:
         or not value.strip()
         or len(value) > _MAX_USAGE_MODEL_CHARS
         or any(character < " " or character == "\x7f" for character in value)
+        or any("\ud800" <= character <= "\udfff" for character in value)
     ):
+        # A lone surrogate cannot be encoded as UTF-8 for publication.
         raise ValueError("Invalid allocated usage model")
     return value
 
@@ -644,6 +647,13 @@ def _usage_record(raw: dict[str, Any]) -> dict[str, Any]:
         if allocation not in _USAGE_ALLOCATIONS:
             raise ValueError("Invalid allocated usage allocation")
         record["allocation"] = allocation
+    # Why some requests have no price, and whether a proxy model's rate priced
+    # any of them. The cost sources themselves stay local.
+    reasons = sanitize_reasons(raw.get("unpriced_reasons"))
+    if reasons:
+        record["unpriced_reasons"] = reasons
+    if is_proxy_priced(raw.get("sources")):
+        record["proxy_price"] = True
     return record
 
 
@@ -658,7 +668,7 @@ def sanitize_usage(raw: Any) -> dict[str, Any] | None:
         return None
     try:
         record = _usage_record(raw)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     return record or None
 

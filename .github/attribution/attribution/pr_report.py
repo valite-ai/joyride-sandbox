@@ -11,6 +11,7 @@ import re
 import sqlite3
 from typing import Any, Mapping
 
+from .cost_reasons import add_reasons, describe, is_proxy_priced, limit_reasons
 from .costing import allocate_session_usage
 from .harnesses import harness_display_name
 from .notes import _blame, _blob_content, _changed_files, _tree, record_commit
@@ -516,11 +517,29 @@ def build_pr_report(
             "_estimates": [], "_credits": [], "_equivalents": [],
             "_partial_costs": 0, "_unknown_costs": 0,
             "_unknown_tokens": 0, "_covered_costs": 0, "_covered_tokens": 0,
+            "_reasons": {}, "_without_usage": 0, "_proxy": False,
         })
         group["lines"] += owned_lines[session_id]
         if session_id in economic_participants:
             group["_sessions"].add(session.get("source_session_id") or session_id)
             if session["actor_kind"] == "ai":
+                # The whole usage record, which a session keeps even when none
+                # of its requests had a price and so no telemetry is attached.
+                allocated = (usage or {}).get(session_id)
+                allocated = allocated if isinstance(allocated, Mapping) else {}
+                # Only a cost the total counts is annotated: a session that
+                # reported its own cost does not use its telemetry at all.
+                if (
+                    allocated and session["cost_usd"] is None
+                    and not session.get("cost_covered_by_parent")
+                ):
+                    # Why some requests have no price, and whether a proxy
+                    # model's rate priced any of them.
+                    add_reasons(group["_reasons"], allocated.get("unpriced_reasons"))
+                    if allocated.get("proxy_price") is True or is_proxy_priced(
+                        allocated.get("sources")
+                    ):
+                        group["_proxy"] = True
                 if session.get("cost_in_total"):
                     # A cost this run filled from telemetry is an estimate the
                     # provider priced, so it is summed apart from the cost a
@@ -552,10 +571,14 @@ def build_pr_report(
                             group["_partial_costs"] += 1
                     else:
                         group["_unknown_costs"] += 1
+                        if not allocated:
+                            group["_without_usage"] += 1
                 elif session.get("cost_covered_by_parent"):
                     group["_covered_costs"] += 1
                 elif session["cost_usd"] is None and not session.get("cost_covered_by_parent"):
                     group["_unknown_costs"] += 1
+                    if not allocated:
+                        group["_without_usage"] += 1
                 if session.get("tokens_in_total"):
                     group["_tokens"].append(session["token_count"])
                 elif session.get("tokens_covered_by_parent"):
@@ -575,6 +598,9 @@ def build_pr_report(
         unknown_tokens = group.pop("_unknown_tokens")
         covered_costs = group.pop("_covered_costs")
         covered_tokens = group.pop("_covered_tokens")
+        reasons = group.pop("_reasons")
+        without_usage = group.pop("_without_usage")
+        proxy = group.pop("_proxy")
         group["reported_cost_usd"] = round(math.fsum(costs), 10) if costs else None
         # The estimate, the credits, and their dollar comparison are carried
         # only where this run filled them, so a report built from committed
@@ -595,6 +621,14 @@ def build_pr_report(
         group["total_tokens"] = sum(tokens) if tokens else None
         group["tokens_complete"] = not unknown_tokens and membership_complete
         group["tokens_in_parent"] = bool(covered_tokens and not tokens and not unknown_tokens)
+        # Each is carried only where it says something, so a report whose every
+        # request was priced keeps the exact shape it had.
+        if reasons:
+            group["unpriced_reasons"] = limit_reasons(reasons)
+        if without_usage:
+            group["sessions_without_usage"] = without_usage
+        if proxy:
+            group["proxy_price"] = True
         sources.append(group)
     logical_sessions = {
         (sessions[s]["harness"], sessions[s].get("source_session_id") or s)
@@ -746,6 +780,17 @@ def build_pr_report(
         report["codex_credits"] = economics["codex_credits"]
     if economics["codex_api_equivalent_usd"] is not None:
         report["codex_api_equivalent_usd"] = economics["codex_api_equivalent_usd"]
+    agent_sources = [source for source in sources if source["actor_kind"] == "ai"]
+    reasons: dict[str, float] = {}
+    for source in agent_sources:
+        add_reasons(reasons, source.get("unpriced_reasons"))
+    if reasons:
+        report["unpriced_reasons"] = limit_reasons(reasons)
+    without_usage = sum(source.get("sessions_without_usage", 0) for source in agent_sources)
+    if without_usage:
+        report["sessions_without_usage"] = without_usage
+    if any(source.get("proxy_price") for source in agent_sources):
+        report["proxy_price"] = True
     return report
 
 
@@ -1004,6 +1049,11 @@ def _cost_cell(entry: dict[str, Any]) -> str:
     """
     if entry.get("cost_in_parent"):
         return "Included in parent"
+    cost = _priced_cost(entry)
+    return f"{cost} (proxy price)" if entry.get("proxy_price") else cost
+
+
+def _priced_cost(entry: dict[str, Any]) -> str:
     credits = _amount(entry.get("codex_credits"))
     if credits is not None:
         return _credit_cost(
@@ -1081,6 +1131,13 @@ def render_footer(report: dict[str, Any], *, details_url: str | None = None) -> 
         rows.extend([
             f"| Total | {_sessions_cell(counted)} | {_cost_cell(report)} |", "",
         ])
+        unknown = describe(
+            report.get("unpriced_reasons"),
+            report.get("sessions_without_usage", 0),
+            escape=_label,
+        )
+        if unknown:
+            rows.extend([f"Unknown cost: {unknown}", ""])
     if details_url:
         if not agents:
             rows.append("")

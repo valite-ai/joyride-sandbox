@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .cost_reasons import sanitize_reasons
 from .runtime import system_subprocess_environment
 
 
@@ -349,7 +350,9 @@ def _usage_model(value: Any) -> str:
         or not value.strip()
         or len(value) > _MAX_USAGE_MODEL_CHARS
         or any(character < " " or character == "\x7f" for character in value)
+        or any("\ud800" <= character <= "\udfff" for character in value)
     ):
+        # A lone surrogate cannot be encoded as UTF-8 for publication.
         raise ValueError("Joyride usage names an unpublishable model.")
     return value
 
@@ -417,6 +420,17 @@ def _usage_record(source: dict[str, Any]) -> dict[str, Any]:
         if allocation not in _USAGE_ALLOCATIONS:
             raise ValueError("Joyride usage carries an invalid allocation.")
         record["allocation"] = allocation
+    # A malformed reason is dropped on its own: it explains a cost and must not
+    # cost the footer the priced record beside it.
+    reasons = sanitize_reasons(source.get("unpriced_reasons"))
+    if reasons:
+        record["unpriced_reasons"] = reasons
+    proxy = source.get("proxy_price")
+    if proxy is not None:
+        if type(proxy) is not bool:
+            raise ValueError("Joyride usage carries an invalid proxy marker.")
+        if proxy:
+            record["proxy_price"] = True
     return record
 
 
@@ -439,7 +453,9 @@ def _snapshot_usage(raw: Any) -> dict[str, dict[str, Any]]:
             continue
         try:
             record = _usage_record(source)
-        except ValueError:
+        except (ValueError, OverflowError):
+            # A number too large for a float raises OverflowError; the record
+            # is optional, so it is dropped like any other malformed one.
             continue
         if not record:
             continue

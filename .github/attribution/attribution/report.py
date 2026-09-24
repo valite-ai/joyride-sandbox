@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
 from .activity import CONTEXT_LOAD_KINDS, TOOL_CLASSES
+from .cost_reasons import add_reasons, is_proxy_priced, limit_reasons
 from .harnesses import harness_display_name
 from .notes import MAX_NOTE_BYTES
 from .workflow import (
@@ -1858,6 +1859,11 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     missing_tokens = 0
     cost_covered_sessions = 0
     ai_session_count = 0
+    # Why part of the cost is unknown, and whether a proxy model's rate priced
+    # part of it, for the sessions this total counts.
+    unpriced_reasons: dict[str, float] = {}
+    without_usage = 0
+    proxy_price = False
     for session in sessions:
         values = cost_values(session)
         # A manual session has no usage by definition, so it can be missing
@@ -1870,6 +1876,17 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             session, lambda item: item.get("token_count") is not None
         )
         session["cost_covered_by_parent"] = cost_ancestor is not None
+        # A session that reported its own cost does not use its telemetry, so
+        # only a session priced by telemetry, or not priced at all, adds notes.
+        if not manual and cost_ancestor is None and session.get("cost_usd") is None:
+            telemetry = session.get("telemetry")
+            if isinstance(telemetry, dict):
+                add_reasons(unpriced_reasons, telemetry.get("unpriced_reasons"))
+                proxy_price = proxy_price or telemetry.get("proxy_price") is True or (
+                    is_proxy_priced(telemetry.get("sources"))
+                )
+            else:
+                without_usage += 1
         session["tokens_covered_by_parent"] = token_ancestor is not None
         session["cost_in_total"] = cost_ancestor is None and has_cost(session)
         session["tokens_in_total"] = (
@@ -1922,6 +1939,9 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens": sum(counted_tokens) if counted_tokens else None,
         "tokens_complete": ai_session_count > 0 and missing_tokens == 0,
         "missing_token_session_count": missing_tokens,
+        "unpriced_reasons": limit_reasons(unpriced_reasons),
+        "sessions_without_usage": without_usage,
+        "proxy_price": proxy_price,
     }
 
 

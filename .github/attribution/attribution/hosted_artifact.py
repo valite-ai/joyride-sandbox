@@ -19,6 +19,7 @@ from typing import Any, Mapping
 import unicodedata
 
 from .code import build_pr_code_file, list_pr_code_files
+from .cost_reasons import sanitize_reasons
 from .pr_report import build_pr_report, fallback_narrative
 from .runtime import system_subprocess_environment
 
@@ -436,6 +437,27 @@ def _keys(
     return value
 
 
+# Why part of a cost is unknown, and whether a proxy model's rate priced part
+# of it. A report carries each key only where it says something.
+_COST_REASON_KEYS = frozenset({"unpriced_reasons", "sessions_without_usage", "proxy_price"})
+
+
+def _validate_cost_reasons(record: Mapping[str, Any], label: str) -> None:
+    reasons = record.get("unpriced_reasons")
+    if reasons is not None and (
+        not isinstance(reasons, dict) or not reasons or sanitize_reasons(reasons) != reasons
+    ):
+        raise ValueError(f"Artifact {label} unpriced reasons are invalid.")
+    without_usage = record.get("sessions_without_usage")
+    if without_usage is not None and (
+        isinstance(without_usage, bool) or not isinstance(without_usage, int)
+        or without_usage < 1
+    ):
+        raise ValueError(f"Artifact {label} session count without usage is invalid.")
+    if "proxy_price" in record and record["proxy_price"] is not True:
+        raise ValueError(f"Artifact {label} proxy price marker is invalid.")
+
+
 def _validate_narrative(text: Any, origin: Any) -> None:
     """Accept one bounded paragraph with its source, or neither of them."""
     if text is None and origin is None:
@@ -680,9 +702,10 @@ def validate_artifact(value: Any, *, require_digest: bool = True) -> dict[str, A
         "base_commit", "merge_base", "head_commit", "added_lines", "counts", "sources",
         "session_count", "ai_session_count", "reported_cost_usd", "cost_complete",
         "total_tokens", "tokens_complete", "complete", "warnings",
-    }, "summary", optional=set(_UNSIGNED_SUMMARY_KEYS) | {
+    }, "summary", optional=set(_UNSIGNED_SUMMARY_KEYS) | _COST_REASON_KEYS | {
         "estimated_cost_usd", "codex_credits", "codex_api_equivalent_usd",
     })
+    _validate_cost_reasons(summary, "summary")
     _validate_narrative(
         summary.get("narrative_summary"), summary.get("narrative_source")
     )
@@ -723,10 +746,11 @@ def validate_artifact(value: Any, *, require_digest: bool = True) -> dict[str, A
     for source in summary["sources"]:
         record = _keys(
             source, source_fields, "summary source",
-            optional={
+            optional=_COST_REASON_KEYS | {
                 "estimated_cost_usd", "codex_credits", "codex_api_equivalent_usd",
             },
         )
+        _validate_cost_reasons(record, "summary source")
         if record["actor_kind"] not in {"ai", "manual"}:
             raise ValueError("Artifact summary source actor is invalid.")
         if not isinstance(record["model"], str) or not record["model"] or not isinstance(record["harness"], str):
