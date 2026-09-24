@@ -10,6 +10,11 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
 from .pricing import price_event, price_openai_api
+from .usage_fallback import (
+    FALLBACK_EVENT_NAME,
+    MAIN_THREAD_SOURCE,
+    TRANSCRIPT_USAGE_SOURCE,
+)
 
 
 _COMPLETED_CAPTURE_STATES = {
@@ -20,11 +25,16 @@ _COMPLETED_CAPTURE_STATES = {
 }
 # What Claude Code names as the source of a request that its own loop made,
 # rather than one an agent it started made.
-_MAIN_QUERY_SOURCES = {"sdk", "repl_main_thread"}
+_MAIN_QUERY_SOURCES = {"sdk", "repl_main_thread", MAIN_THREAD_SOURCE}
 
 
 _REQUEST_EVENTS = frozenset(
-    {"claude_code.api_request", "codex.sse_event", "codex.turn.token_usage"}
+    {
+        "claude_code.api_request",
+        "codex.sse_event",
+        "codex.turn.token_usage",
+        FALLBACK_EVENT_NAME,
+    }
 )
 
 
@@ -343,6 +353,46 @@ def _telemetry_rows(repository_id: str) -> tuple[list[dict[str, Any]], list[dict
     )
 
 
+def _prefer_telemetry(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop usage-fallback rows that a telemetry event already reports.
+
+    A Claude request carries the same request ID in its telemetry event and in
+    its transcript line, so the transcript row for it is dropped. Codex
+    telemetry events carry no request ID, so a Codex session with any
+    telemetry keeps only telemetry.
+    """
+
+    reported_requests: set[str] = set()
+    reported_codex_sessions: set[str] = set()
+    for event in events:
+        if event.get("event_name") == FALLBACK_EVENT_NAME:
+            continue
+        if event.get("provider") == "claude":
+            request = _identity(event.get("request_id"))
+            if request is not None:
+                reported_requests.add(request)
+        elif event.get("provider") == "codex":
+            native = _base_native_session(event.get("native_session_id"))
+            if native is not None:
+                reported_codex_sessions.add(native)
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event_name") == FALLBACK_EVENT_NAME:
+            if (
+                event.get("provider") == "claude"
+                and _identity(event.get("request_id")) in reported_requests
+            ):
+                continue
+            if (
+                event.get("provider") == "codex"
+                and _base_native_session(event.get("native_session_id"))
+                in reported_codex_sessions
+            ):
+                continue
+        kept.append(event)
+    return kept
+
+
 def _weighted_targets(routes: Counter[str], valid: set[str]) -> dict[str, float]:
     # The total is over every session the route names, so the share of a
     # session this caller did not pass is left out rather than handed to its
@@ -365,7 +415,7 @@ def unpriced_request_counts(events: Iterable[Mapping[str, Any]]) -> dict[str, in
     """
 
     counts: Counter[str] = Counter()
-    for event in events:
+    for event in _prefer_telemetry([dict(item) for item in events]):
         if event.get("event_name") not in _REQUEST_EVENTS:
             continue
         if _number(event.get("cost_usd")) is not None or _number(event.get("credits")) is not None:
@@ -410,6 +460,7 @@ def allocate_session_usage(
             events = loaded_events
         if prompt_tool_links is None:
             prompt_tool_links = loaded_links
+    events = _prefer_telemetry(list(events))
     if not events:
         return {}
 
@@ -482,32 +533,34 @@ def allocate_session_usage(
 
         route = Counter()
         allocation = "session-allocated"
-        if provider == "claude":
-            targets = _agent_targets(raw_event, eligible, by_id)
-            if targets and targets != eligible:
-                # The agent identity narrows this request to fewer sessions
-                # than the native session holds. Where it names every one of
-                # them, or none, it separates nothing and the links below
-                # decide exactly as they did before.
-                route.update(
-                    _agent_route(
-                        targets,
-                        raw_event,
-                        harness,
-                        native,
-                        prompt_links,
-                        tools,
-                        native_routes,
-                    )
+        targets = _agent_targets(raw_event, eligible, by_id)
+        if targets and targets != eligible:
+            # The agent identity narrows this request to fewer sessions than
+            # the native session holds. Where it names every one of them, or
+            # none, it separates nothing and the links below decide exactly as
+            # they did before. A Codex usage-fallback row names a subagent's
+            # thread the way the subagent's own hooks do.
+            route.update(
+                _agent_route(
+                    targets,
+                    raw_event,
+                    harness,
+                    native,
+                    prompt_links,
+                    tools,
+                    native_routes,
                 )
-                allocation = "agent-routed"
-            if not route:
-                prompt = raw_event.get("prompt_id")
-                if isinstance(prompt, str) and prompt:
-                    for tool in prompt_links.get((native, prompt), []):
-                        route.update(tools.get((native, tool), {}))
-                    if route:
-                        allocation = "tool-linked"
+            )
+            allocation = "agent-routed"
+        if route:
+            pass
+        elif provider == "claude":
+            prompt = raw_event.get("prompt_id")
+            if isinstance(prompt, str) and prompt:
+                for tool in prompt_links.get((native, prompt), []):
+                    route.update(tools.get((native, tool), {}))
+                if route:
+                    allocation = "tool-linked"
         elif provider == "codex":
             turn = raw_event.get("turn_id")
             if isinstance(turn, str) and turn:
@@ -601,6 +654,9 @@ def allocate_session_usage(
             source = event_values.get("cost_source")
             if isinstance(source, str) and source:
                 usage["sources"].add(source)
+            if raw_event.get("event_name") == FALLBACK_EVENT_NAME:
+                # The usage came from the session file, not from telemetry.
+                usage["sources"].add(TRANSCRIPT_USAGE_SOURCE)
             usage["allocations"].add(allocation)
 
     result: dict[str, dict[str, Any]] = {}

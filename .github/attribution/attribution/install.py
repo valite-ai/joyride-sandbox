@@ -1556,6 +1556,7 @@ def installation_status(repo: str | Path) -> dict[str, Any]:
         "claude": _claude_cost_status(repository, manifest, worktree_id)
     }
     base["traces_enabled"] = manifest.get("traces_enabled") is not False
+    base["usage_fallback"] = manifest.get("usage_fallback") is not False
     enabled_ids = set(manifest["enabled_worktrees"])
     base["repository_installed"] = bool(enabled_ids)
     base["enabled_worktree_count"] = len(enabled_ids)
@@ -1779,13 +1780,15 @@ def _install_worktree(
     repo: str | Path,
     *,
     traces_enabled: bool | None = None,
+    usage_fallback: bool | None = None,
     native_hooks: bool = True,
     telemetry: bool | None = None,
     machine_git_hooks: bool = False,
 ) -> dict[str, Any]:
     """Idempotently install native and Git automation for one worktree.
 
-    ``traces_enabled`` preserves the repository's recorded choice when None.
+    ``traces_enabled`` and ``usage_fallback`` preserve the repository's
+    recorded choices when None.
     ``native_hooks`` is false when machine-level hooks already run. That
     worktree receives its Git publisher and a manifest with the user scope.
     ``telemetry`` defaults to ``native_hooks``; the machine install passes its
@@ -2209,6 +2212,10 @@ def _install_worktree(
         manifest["traces_enabled"] = traces_enabled
     else:
         manifest.setdefault("traces_enabled", True)
+    if usage_fallback is not None:
+        manifest["usage_fallback"] = usage_fallback
+    else:
+        manifest.setdefault("usage_fallback", True)
     if native_hooks:
         manifest.pop("hook_scope", None)
     else:
@@ -2424,8 +2431,9 @@ def _reinstall_user_scope(
     *,
     all_worktrees: bool,
     traces_enabled: bool,
+    usage_fallback: bool,
 ) -> dict[str, Any]:
-    """Apply a repository install's trace choice to a clone under machine hooks."""
+    """Apply a repository install's choices to a clone under machine hooks."""
 
     from .global_git_hooks import runs_machine_hooks
 
@@ -2440,6 +2448,7 @@ def _reinstall_user_scope(
         _install_worktree(
             candidate.root,
             traces_enabled=traces_enabled,
+            usage_fallback=usage_fallback,
             native_hooks=False,
             telemetry=machine.get("telemetry_enabled") is True,
             machine_git_hooks=runs_machine_hooks(candidate.root, machine.get("git_hooks")),
@@ -2450,7 +2459,11 @@ def _reinstall_user_scope(
 
 
 def install_repo(
-    repo: str | Path, *, all_worktrees: bool = True, traces_enabled: bool = True
+    repo: str | Path,
+    *,
+    all_worktrees: bool = True,
+    traces_enabled: bool = True,
+    usage_fallback: bool = True,
 ) -> dict[str, Any]:
     """Install automation throughout a repository's live worktrees.
 
@@ -2474,6 +2487,7 @@ def install_repo(
                 machine,
                 all_worktrees=all_worktrees,
                 traces_enabled=traces_enabled,
+                usage_fallback=usage_fallback,
             )
     telemetry_enabled = os.environ.get(_DISABLE_TELEMETRY_ENV) != "1"
     collector_was_running = False
@@ -2495,7 +2509,11 @@ def install_repo(
     try:
         for worktree in worktrees:
             candidate = worktree.repository
-            _install_worktree(candidate.root, traces_enabled=traces_enabled)
+            _install_worktree(
+                candidate.root,
+                traces_enabled=traces_enabled,
+                usage_fallback=usage_fallback,
+            )
             if str(candidate.git_dir) not in enabled_before:
                 newly_enabled.append(candidate)
     except BaseException as install_error:

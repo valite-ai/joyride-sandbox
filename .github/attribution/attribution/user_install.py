@@ -92,7 +92,7 @@ def _machine_lock() -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _serialized(function: Callable[[], _Result]) -> Callable[[], _Result]:
+def _serialized(function: Callable[..., _Result]) -> Callable[..., _Result]:
     """Run ``function`` under the machine lock.
 
     Two Git hooks can repair at the same time. Each one must read the
@@ -101,9 +101,9 @@ def _serialized(function: Callable[[], _Result]) -> Callable[[], _Result]:
     """
 
     @functools.wraps(function)
-    def locked() -> _Result:
+    def locked(*args: Any, **kwargs: Any) -> _Result:
         with _machine_lock():
-            return function()
+            return function(*args, **kwargs)
 
     return locked
 
@@ -410,8 +410,12 @@ def _codex_warning(codex: Any) -> str | None:
 
 
 @_serialized
-def install_user_hooks() -> dict[str, Any]:
-    """Write the harness hooks once for this machine and every repository."""
+def install_user_hooks(*, usage_fallback: bool = True) -> dict[str, Any]:
+    """Write the harness hooks once for this machine and every repository.
+
+    ``usage_fallback`` false stops every clone under these hooks from reading
+    usage out of session files when telemetry is missing.
+    """
 
     runtime = _runtime()
     previous = load_user_manifest()
@@ -492,6 +496,7 @@ def install_user_hooks() -> dict[str, Any]:
         "launcher_sha256": _sha256(launcher_bytes),
         "telemetry_enabled": telemetry_enabled,
         "telemetry_registered": registered,
+        "usage_fallback": usage_fallback,
         "created_dirs": created_dirs,
         "integrations": {},
     }
@@ -811,6 +816,7 @@ def user_install_status() -> dict[str, Any]:
     }
     if manifest is not None:
         status["git_hooks"] = git_hooks_health(manifest.get("git_hooks"))
+        status["usage_fallback"] = manifest.get("usage_fallback") is not False
     return status
 
 

@@ -43,12 +43,14 @@ _RESPONSE_LIMIT = 64 * 1024
 
 # The hook code reads these variables, directly or through the Git processes
 # that it starts. Git reads HOME and XDG_CONFIG_HOME for its global
-# configuration, ignore rules, and attributes. A collector serves an event
-# only when its own values match the client's, so an event never runs under
-# another session's configuration. The hook code does not read CODEX_HOME or
-# CLAUDE_CONFIG_DIR, and PATH differs between coding tools without changing
-# what Git reads, so those do not split sessions.
-_ENVIRONMENT_NAMES = frozenset({"HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"})
+# configuration, ignore rules, and attributes. The usage fallback finds
+# session files under CODEX_HOME and CLAUDE_CONFIG_DIR. A collector serves an
+# event only when its own values match the client's, so an event never runs
+# under another session's configuration. PATH differs between coding tools
+# without changing what the hook code reads, so it does not split sessions.
+_ENVIRONMENT_NAMES = frozenset(
+    {"HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"}
+)
 _ENVIRONMENT_PREFIXES = (
     "ATTRIBUTION_",
     "HARNESS_ATTRIBUTION_",

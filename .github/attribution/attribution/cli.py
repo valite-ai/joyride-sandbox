@@ -118,6 +118,11 @@ def parser() -> argparse.ArgumentParser:
         help="Do not keep or publish the text of sessions in this repository",
     )
     install.add_argument(
+        "--no-usage-fallback",
+        action="store_true",
+        help="Do not read token usage from session files when cost telemetry is missing",
+    )
+    install.add_argument(
         "--user",
         action="store_true",
         help="Install the harness hooks once for this machine",
@@ -615,14 +620,18 @@ def main(argv: list[str] | None = None) -> int:
                 from .terminal import render_user_setup
                 from .user_install import install_user_hooks, running_agent_sessions
 
-                status = install_user_hooks()
+                status = install_user_hooks(usage_fallback=not args.no_usage_fallback)
                 status["restart_sessions"] = running_agent_sessions()
                 _emit(render_user_setup(status, installed=True))
                 _report_install(hosted_url, args.code)
                 return 0
             from .install import install_repo
 
-            status = install_repo(_selected_repo(args), traces_enabled=not args.no_traces)
+            status = install_repo(
+                _selected_repo(args),
+                traces_enabled=not args.no_traces,
+                usage_fallback=not args.no_usage_fallback,
+            )
             _emit(_setup_message(status, installed=True))
             _report_install(hosted_url, args.code)
             return 0

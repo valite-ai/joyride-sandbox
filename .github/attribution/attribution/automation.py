@@ -2034,16 +2034,35 @@ def handle_hook(
         if event in {"SessionStart", "PostModelSwitch"}:
             return _handle_metadata(root, payload, harness, native_session_id, event)
         if event in {"SubagentStart", "SubagentStop"}:
-            return _handle_subagent(root, payload, harness, native_session_id, event)
+            result = _handle_subagent(root, payload, harness, native_session_id, event)
+            _record_usage_fallback(root, payload, harness, event)
+            return result
         if event in {"UserPromptSubmit", "Interrupt"}:
             return _handle_turn(root, payload, harness, native_session_id, event)
         if event in {"InstructionsLoaded", "PostCompact"}:
             return _handle_context(root, payload, harness, native_session_id, event)
         if event in {"Stop", "SessionEnd"}:
-            return _handle_stop(root, payload, harness, native_session_id, event)
+            result = _handle_stop(root, payload, harness, native_session_id, event)
+            _record_usage_fallback(root, payload, harness, event)
+            return result
         return _result("ignored")
     except Exception as exc:
         return _result("warning", warnings=[_warning(exc)])
+
+
+def _record_usage_fallback(
+    repo: Path, payload: Mapping[str, Any], harness: str, event: str
+) -> None:
+    """Store the usage in the session file this hook names, if it can."""
+
+    try:
+        from .usage_fallback import record_from_hook
+
+        record_from_hook(repo, payload, harness, event)
+    except Exception:
+        # Usage is optional enrichment. Reading it must never change what a
+        # hook reports to the coding tool or what capture records.
+        pass
 
 
 def _enrolled(repo: Path) -> bool:

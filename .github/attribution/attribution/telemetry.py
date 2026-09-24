@@ -49,7 +49,7 @@ import stat
 import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -105,9 +105,11 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
     model TEXT NULL,
     auth_mode TEXT NULL,
     service_tier TEXT NULL,
+    speed TEXT NULL,
     input_tokens INTEGER NULL,
     cached_input_tokens INTEGER NULL,
     cache_creation_input_tokens INTEGER NULL,
+    cache_creation_1h_input_tokens INTEGER NULL,
     output_tokens INTEGER NULL,
     total_tokens INTEGER NULL,
     cost_amount TEXT NULL,
@@ -129,6 +131,15 @@ CREATE TABLE IF NOT EXISTS telemetry_event_repositories (
     repository_path TEXT NULL,
     PRIMARY KEY (event_key, repository_id),
     FOREIGN KEY (event_key) REFERENCES telemetry_events(event_key) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS usage_fallback_cursors (
+    file_key TEXT PRIMARY KEY,
+    device INTEGER NOT NULL,
+    inode INTEGER NOT NULL,
+    read_offset INTEGER NOT NULL,
+    state TEXT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS claude_prompt_tool_links (
@@ -289,11 +300,17 @@ class TelemetryStore:
                 "parent_agent_id",
                 "agent_name",
                 "effort",
+                "speed",
             ):
                 if workflow_column not in columns:
                     connection.execute(
                         f"ALTER TABLE telemetry_events ADD COLUMN {workflow_column} TEXT"
                     )
+            if "cache_creation_1h_input_tokens" not in columns:
+                connection.execute(
+                    "ALTER TABLE telemetry_events "
+                    "ADD COLUMN cache_creation_1h_input_tokens INTEGER"
+                )
             if "telemetry_event_repositories" not in existing_tables:
                 connection.execute(
                     """
@@ -641,6 +658,192 @@ class TelemetryStore:
                 parameters,
             ).fetchall()
         return [_event_row(row) for row in rows]
+
+    def fallback_cursor(self, file_key: str) -> dict[str, Any] | None:
+        """Return where the usage fallback stopped reading one session file."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT device, inode, read_offset, state
+                FROM usage_fallback_cursors WHERE file_key = ?
+                """,
+                (file_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        state: Any = None
+        if row["state"] is not None:
+            try:
+                state = json.loads(row["state"])
+            except ValueError:
+                state = None
+        return {
+            "device": row["device"],
+            "inode": row["inode"],
+            "offset": row["read_offset"],
+            "state": state if isinstance(state, dict) else None,
+        }
+
+    def record_fallback_usage(
+        self,
+        rows: Iterable[Any],
+        *,
+        repository_id: str | os.PathLike[str],
+        repository_path: str | os.PathLike[str] | None,
+        file_key: str,
+        cursor: Mapping[str, Any],
+    ) -> int:
+        """Store usage-fallback rows and the read cursor in one transaction.
+
+        A streamed copy of a request replaces the stored one only when it
+        reports more output. Telemetry events are never replaced here.
+        Returns the number of rows inserted or updated.
+        """
+
+        from .usage_fallback import FALLBACK_EVENT_NAME
+
+        repository = _bounded_text(repository_id, 4096)
+        if repository is None:
+            raise TelemetryError("repository_id must be a non-empty short string")
+        path_text = _bounded_text(repository_path, 4096) if repository_path else None
+        state = cursor.get("state")
+        state_text = (
+            json.dumps(state, separators=(",", ":"), sort_keys=True)
+            if isinstance(state, dict)
+            else None
+        )
+        if state_text is not None and len(state_text) > 4096:
+            state_text = None
+        changed = 0
+        with self._connection() as connection:
+            for row in rows:
+                cursor_result = connection.execute(
+                    """
+                    INSERT INTO telemetry_events (
+                        event_key, provider, event_name, event_kind,
+                        native_session_id, turn_id, request_id, client_request_id,
+                        model, auth_mode, service_tier, speed, input_tokens,
+                        cached_input_tokens, cache_creation_input_tokens,
+                        cache_creation_1h_input_tokens, output_tokens,
+                        total_tokens, cost_amount, cost_unit, cost_source,
+                        unpriced_reason, agent_id, query_source,
+                        observed_at_unix_nano
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?
+                    )
+                    ON CONFLICT(event_key) DO UPDATE SET
+                        cost_amount = excluded.cost_amount,
+                        cost_unit = excluded.cost_unit,
+                        cost_source = excluded.cost_source,
+                        unpriced_reason = excluded.unpriced_reason,
+                        auth_mode = excluded.auth_mode,
+                        model = excluded.model,
+                        service_tier = excluded.service_tier,
+                        speed = excluded.speed,
+                        input_tokens = excluded.input_tokens,
+                        cached_input_tokens = excluded.cached_input_tokens,
+                        cache_creation_input_tokens =
+                            excluded.cache_creation_input_tokens,
+                        cache_creation_1h_input_tokens =
+                            excluded.cache_creation_1h_input_tokens,
+                        output_tokens = excluded.output_tokens,
+                        total_tokens = excluded.total_tokens
+                    WHERE telemetry_events.event_name = excluded.event_name
+                      AND (
+                          COALESCE(excluded.output_tokens, 0)
+                              > COALESCE(telemetry_events.output_tokens, 0)
+                          OR (
+                              telemetry_events.auth_mode IS NULL
+                              AND excluded.auth_mode IS NOT NULL
+                          )
+                      )
+                    """,
+                    (
+                        row.event_key,
+                        row.provider,
+                        FALLBACK_EVENT_NAME,
+                        row.event_kind,
+                        row.native_session_id,
+                        row.turn_id,
+                        row.request_id,
+                        row.client_request_id,
+                        row.model,
+                        row.auth_mode,
+                        row.service_tier,
+                        row.speed,
+                        row.input_tokens,
+                        row.cached_input_tokens,
+                        row.cache_creation_input_tokens,
+                        row.cache_creation_1h_input_tokens,
+                        row.output_tokens,
+                        row.total_tokens,
+                        row.cost_amount,
+                        row.cost_unit,
+                        row.cost_source,
+                        row.unpriced_reason,
+                        row.agent_id,
+                        row.query_source,
+                        row.observed_at_unix_nano,
+                    ),
+                )
+                if cursor_result.rowcount:
+                    changed += 1
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO telemetry_event_repositories (
+                            event_key, repository_id, repository_path
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (row.event_key, repository, path_text),
+                    )
+            connection.execute(
+                """
+                INSERT INTO usage_fallback_cursors (
+                    file_key, device, inode, read_offset, state
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(file_key) DO UPDATE SET
+                    device = excluded.device,
+                    inode = excluded.inode,
+                    read_offset = excluded.read_offset,
+                    state = excluded.state,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    file_key,
+                    int(cursor["device"]),
+                    int(cursor["inode"]),
+                    int(cursor["offset"]),
+                    state_text,
+                ),
+            )
+        return changed
+
+    def fallback_rows_without_auth(
+        self, provider: str, native_session_id: str, agent_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Return one thread's usage-fallback rows stored before its sign-in was known."""
+
+        from .usage_fallback import FALLBACK_EVENT_NAME
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_key, provider, event_kind, native_session_id,
+                       agent_id, query_source, turn_id, request_id,
+                       client_request_id, model, service_tier, speed,
+                       input_tokens, cached_input_tokens,
+                       cache_creation_input_tokens,
+                       cache_creation_1h_input_tokens, output_tokens,
+                       total_tokens, observed_at_unix_nano
+                FROM telemetry_events
+                WHERE event_name = ? AND provider = ? AND native_session_id = ?
+                  AND agent_id IS ? AND auth_mode IS NULL
+                """,
+                (FALLBACK_EVENT_NAME, provider, native_session_id, agent_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def query_claude_prompt_tool_links(
         self,
