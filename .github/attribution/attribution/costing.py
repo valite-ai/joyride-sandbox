@@ -23,6 +23,11 @@ _COMPLETED_CAPTURE_STATES = {
 _MAIN_QUERY_SOURCES = {"sdk", "repl_main_thread"}
 
 
+_REQUEST_EVENTS = frozenset(
+    {"claude_code.api_request", "codex.sse_event", "codex.turn.token_usage"}
+)
+
+
 def _base_native_session(value: Any) -> str | None:
     if not isinstance(value, str) or not value:
         return None
@@ -352,6 +357,25 @@ def _weighted_targets(routes: Counter[str], valid: set[str]) -> dict[str, float]
     }
 
 
+def unpriced_request_counts(events: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    """Count the requests that the current prices cannot price, by reason.
+
+    Each stored request without a cost is priced again, as session usage is,
+    so a request stored before its model had a price no longer counts.
+    """
+
+    counts: Counter[str] = Counter()
+    for event in events:
+        if event.get("event_name") not in _REQUEST_EVENTS:
+            continue
+        if _number(event.get("cost_usd")) is not None or _number(event.get("credits")) is not None:
+            continue
+        price = price_event(event.get("provider"), event)
+        if price.amount is None:
+            counts[price.unpriced_reason or "missing_model"] += 1
+    return dict(sorted(counts.items()))
+
+
 def allocate_session_usage(
     common_dir: str | Path,
     sessions: Iterable[Mapping[str, Any]],
@@ -414,11 +438,7 @@ def allocate_session_usage(
         if harness is None or native is None:
             continue
         event_values = dict(raw_event)
-        is_request = raw_event.get("event_name") in {
-            "claude_code.api_request",
-            "codex.sse_event",
-            "codex.turn.token_usage",
-        }
+        is_request = raw_event.get("event_name") in _REQUEST_EVENTS
         unpriced_reason: str | None = None
         if (
             is_request

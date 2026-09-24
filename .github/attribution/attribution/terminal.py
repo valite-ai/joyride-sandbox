@@ -1712,6 +1712,38 @@ def _install_state(value: Any) -> str:
     }.get(value, "unknown")
 
 
+_UNPRICED_DETAILS = {
+    "missing_model": "the request named no model",
+    "missing_tokens": "the request had no token counts",
+    "unknown_service_tier": "unknown service tier {detail}",
+    "no_long_context_price": "no long-context price for model {detail}",
+}
+
+
+def _unpriced_warnings(value: Any) -> list[str]:
+    """Name each model or reason that left local requests without a price."""
+
+    counts = _mapping(value)
+    warnings: list[str] = []
+    for reason, count in sorted(counts.items()):
+        requests = _counted(count, "request")
+        kind, _separator, detail = safe_text(reason).partition(":")
+        if kind == "unknown_model" and detail:
+            warnings.append(
+                f"Joyride has no price for model {detail} ({requests}), so their cost is "
+                "unknown. Update Joyride. A new model also needs an entry in "
+                "attribution/data/supported_models.json."
+            )
+        elif kind == "no_published_price" and detail:
+            warnings.append(
+                f"Model {detail} has no published price ({requests}), so their cost stays unknown."
+            )
+        else:
+            text = _UNPRICED_DETAILS.get(kind, kind).format(detail=detail or "unknown")
+            warnings.append(f"{requests} could not be priced: {text}.")
+    return warnings
+
+
 def render_status(
     installation: Mapping[str, Any],
     automation: Mapping[str, Any] | None,
@@ -1874,7 +1906,10 @@ def render_status(
             item for item in queue_warnings
             if "not enabled for this worktree" not in safe_text(item).casefold()
         ]
-    lines.extend(_warning_lines(installation_warnings, queue_warnings, width=output_width))
+    cost_warnings = _unpriced_warnings(status.get("unpriced_requests"))
+    lines.extend(
+        _warning_lines(installation_warnings, queue_warnings, cost_warnings, width=output_width)
+    )
     return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"
 
 

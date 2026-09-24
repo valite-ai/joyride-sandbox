@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from typing import Any, TextIO
 from urllib.parse import urlencode
@@ -927,6 +928,16 @@ def main(argv: list[str] | None = None) -> int:
             selected = _selected_repo(args)
             installation = installation_status(selected)
             installation["user_scope"] = user_install_status()
+            try:
+                from .costing import unpriced_request_counts
+                from .telemetry import query_events
+
+                unpriced = unpriced_request_counts(query_events())
+            except (OSError, ValueError, sqlite3.Error):
+                # Status stays useful when local telemetry cannot be read.
+                unpriced = {}
+            if unpriced:
+                installation["unpriced_requests"] = unpriced
             if installation.get("repository_installed") is True:
                 try:
                     from .store import git_common_dir
