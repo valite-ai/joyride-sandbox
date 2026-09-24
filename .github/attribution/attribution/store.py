@@ -5,17 +5,22 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 import fcntl
+import json
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
-from typing import Iterator, Union
+from typing import Any, Iterator, Union
 
 from .runtime import system_subprocess_environment
 
 
 RepoPath = Union[str, Path]
 SUPPORTED_SCHEMA_VERSION = 6
+# The largest configuration file that Joyride reads. The installer writes no
+# install manifest over it, and every hook reads the manifest through
+# ``read_install_state``, which refuses a larger one.
+MAX_CONFIG_BYTES = 2 * 1024 * 1024
 
 
 _SCHEMA = """
@@ -398,11 +403,14 @@ _git_path_cache: dict[tuple[str, str], Path] = {}
 _git_path_scope: ContextVar[dict[tuple[str, str], Path] | None] = ContextVar(
     "attribution_git_path_scope", default=None
 )
+_install_state_scope: ContextVar[
+    dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] | None
+] = ContextVar("attribution_install_state_scope", default=None)
 
 
 @contextmanager
 def git_path_scope() -> Iterator[None]:
-    """Cache Git paths only for the work inside this block.
+    """Cache Git paths and the install manifest only for the work inside this block.
 
     A short CLI process may keep its paths for its whole life. A long-lived
     process uses one scope for each unit of work, because a worktree can move
@@ -410,9 +418,11 @@ def git_path_scope() -> Iterator[None]:
     """
 
     token = _git_path_scope.set({})
+    state_token = _install_state_scope.set({})
     try:
         yield
     finally:
+        _install_state_scope.reset(state_token)
         _git_path_scope.reset(token)
 
 
@@ -451,6 +461,45 @@ def git_dir(repo: RepoPath) -> Path:
     """Return the absolute per-worktree Git directory."""
 
     return _git_path(repo, "--git-dir")
+
+
+def read_install_state(repo: RepoPath) -> dict[str, Any] | None:
+    """Return the repository's install manifest as every hook reads it.
+
+    Returns None when the repository has no manifest. Raises OSError when it
+    cannot be read, and ValueError when it is larger than MAX_CONFIG_BYTES, is
+    not UTF-8 JSON, or is not an object. Inside ``git_path_scope`` a hook event
+    parses an unchanged manifest once, so callers must not modify the result.
+    """
+
+    path = git_common_dir(repo) / "attribution" / "install.json"
+    try:
+        details = path.stat()
+    except FileNotFoundError:
+        return None
+    if details.st_size > MAX_CONFIG_BYTES:
+        raise ValueError("Native automation state is oversized and was ignored.")
+    # The installer replaces the file, so a new manifest has a new inode.
+    key = (details.st_ino, details.st_size, details.st_mtime_ns)
+    states = _install_state_scope.get()
+    cached = states.get(path) if states is not None else None
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_CONFIG_BYTES + 1)
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ValueError("Native automation state is oversized and was ignored.")
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Native automation state is malformed and was ignored.") from exc
+    if not isinstance(state, dict):
+        raise ValueError(
+            "Native automation state has an unsupported format and was ignored."
+        )
+    if states is not None:
+        states[path] = (key, state)
+    return state
 
 
 def open_db(repo: RepoPath) -> sqlite3.Connection:

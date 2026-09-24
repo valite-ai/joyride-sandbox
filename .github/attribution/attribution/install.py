@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import copy
+import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -13,7 +16,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Callable, Iterator, TypeVar
+import uuid
 
 from .activity import SNAPSHOT_TOOL_NAMES
 from .runtime import (
@@ -22,7 +26,7 @@ from .runtime import (
     stored_runtime,
     system_subprocess_environment,
 )
-from .store import git_common_dir, git_dir, repository_root
+from .store import MAX_CONFIG_BYTES, git_common_dir, git_dir, repository_root
 
 
 # ``runtime_kind`` is an additive v1 field. Missing values are legacy Python
@@ -52,7 +56,6 @@ _EPHEMERAL_RUNTIME_ERROR = (
     "uv tool install git+https://github.com/valite-ai/attribution-hosted "
     "(or pipx install with the same URL) and run the command again."
 )
-_MAX_CONFIG_BYTES = 2 * 1024 * 1024
 _EXCLUDE_BLOCK = (
     b"# >>> attribution-managed-v1\n"
     b"/.codex/hooks.json\n"
@@ -227,12 +230,18 @@ class _Transaction:
         self._ensure_parent(path.parent)
         _atomic_write(path, data, mode=mode, times=times)
 
-    def delete(self, path: Path) -> None:
+    def delete(self, path: Path, *, remove_empty_parent: bool = False) -> None:
         self._capture(path)
         try:
             path.unlink()
         except FileNotFoundError:
             pass
+        if remove_empty_parent:
+            # A rollback that restores the file creates the directory again.
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
 
     def rollback(self) -> None:
         failures: list[str] = []
@@ -321,6 +330,42 @@ def _repository(repo: str | Path) -> _Repository:
     )
 
 
+_Result = TypeVar("_Result")
+
+
+@contextmanager
+def _install_lock(repository: _Repository) -> Iterator[None]:
+    """Hold the repository's install lock for one install, uninstall, or heal.
+
+    The lock is on the common Git directory itself, so taking it writes
+    nothing, and a first install that fails still leaves no trace.
+    """
+
+    descriptor = os.open(repository.common_dir, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(descriptor)
+
+
+def _serialized(function: Callable[..., _Result]) -> Callable[..., _Result]:
+    """Run ``function`` under the install lock of the repository it names.
+
+    Each call reads the manifest, prunes it, and writes it back. Two calls at
+    once, such as the checkouts of two new worktrees, would otherwise each
+    write a manifest without the other's worktree.
+    """
+
+    @functools.wraps(function)
+    def locked(repo: str | Path, *args: Any, **kwargs: Any) -> _Result:
+        with _install_lock(_repository(repo)):
+            return function(repo, *args, **kwargs)
+
+    return locked
+
+
 def _discover_worktrees(
     repository: _Repository,
 ) -> tuple[list[_LinkedWorktree], list[str]]:
@@ -405,13 +450,15 @@ def _json_bytes(value: dict[str, Any]) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def _file_details(path: Path) -> tuple[bytes, int, int, int]:
+def _file_details(
+    path: Path, limit: int | None = MAX_CONFIG_BYTES
+) -> tuple[bytes, int, int, int]:
     details = path.lstat()
     if stat.S_ISLNK(details.st_mode):
         raise ValueError(f"Refusing to follow symlink {path}.")
     if not stat.S_ISREG(details.st_mode):
         raise ValueError(f"Expected a regular file at {path}.")
-    if details.st_size > _MAX_CONFIG_BYTES:
+    if limit is not None and details.st_size > limit:
         raise ValueError(f"Configuration file is too large: {path}.")
     return (
         path.read_bytes(),
@@ -455,30 +502,99 @@ def _load_json_config(path: Path) -> tuple[dict[str, Any], bytes | None, int, in
     return value, raw, mode, atime_ns, mtime_ns
 
 
-def _load_manifest(repository: _Repository) -> dict[str, Any] | None:
+class _RejectedManifest(ValueError):
+    """An install manifest that the installer refuses, and how to repair it."""
+
+    def __init__(self, problem: str, action: str) -> None:
+        super().__init__(f"{problem} {action}")
+        self.problem = problem
+        self.action = action
+
+
+def _load_manifest(
+    repository: _Repository, *, oversized: bool = False
+) -> dict[str, Any] | None:
+    """Return the install manifest, or None when the repository has none.
+
+    ``oversized`` reads a manifest over MAX_CONFIG_BYTES for a caller that
+    prunes removed worktrees before it writes, which is how install repairs it.
+    """
+
     path = repository.manifest_path
     if not path.exists():
         return None
-    raw, _mode, _atime, _mtime = _file_details(path)
+    fix = f"Fix {path} or restore it from a backup, then run joyride status."
+    try:
+        too_large = path.lstat().st_size > MAX_CONFIG_BYTES and not oversized
+        if not too_large:
+            raw, _mode, _atime, _mtime = _file_details(path, limit=None)
+    except OSError as exc:
+        raise _RejectedManifest(
+            f"Could not read {path}: {exc.strerror or exc}.",
+            "Make the file readable and writable by your user, then run joyride status.",
+        ) from exc
+    except ValueError as exc:
+        raise _RejectedManifest(
+            str(exc),
+            f"Replace {path} with a regular file, for example a copy of the file "
+            "that it links to, then run joyride status.",
+        ) from exc
+    if too_large:
+        raise _RejectedManifest(
+            f"The attribution install manifest is larger than {MAX_CONFIG_BYTES:,} bytes.",
+            "Run joyride install, which drops the records of worktrees that Git "
+            "removed. If the file is still too large, remove worktrees that you no "
+            "longer use with git worktree remove, then run joyride install again.",
+        )
     try:
         manifest = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"The attribution install manifest is malformed: {exc}.") from exc
-    if not isinstance(manifest, dict) or manifest.get("version") != _VERSION:
-        raise ValueError("The attribution install manifest has an unsupported version.")
+        raise _RejectedManifest(
+            f"The attribution install manifest is malformed: {exc}.",
+            f"Fix the JSON error in {path}, or restore the file from a backup, then "
+            "run joyride status.",
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise _RejectedManifest("The attribution install manifest is not an object.", fix)
+    if manifest.get("version") != _VERSION:
+        raise _RejectedManifest(
+            "The attribution install manifest has an unsupported version.",
+            f"Use the Joyride version that wrote {path}, or restore the file from a "
+            "backup, then run joyride status.",
+        )
     enabled = manifest.get("enabled_worktrees")
     integrations = manifest.get("integrations")
+    tokens = manifest.get("worktree_tokens", {})
     if (
         not isinstance(enabled, list)
         or any(not isinstance(item, str) for item in enabled)
         or len(set(enabled)) != len(enabled)
         or not isinstance(integrations, list)
-        or any(not isinstance(item, dict) for item in integrations)
+        or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("worktree_id"), str)
+            or not isinstance(item.get("harness"), str)
+            for item in integrations
+        )
+        or not isinstance(tokens, dict)
+        or any(not isinstance(item, str) for item in tokens.values())
     ):
-        raise ValueError("The attribution install manifest has invalid entries.")
+        raise _RejectedManifest("The attribution install manifest has invalid entries.", fix)
     expected_hooks = str(repository.managed_hooks_path)
-    if manifest.get("managed_hooks_path") != expected_hooks:
-        raise ValueError("The attribution install manifest points outside its managed hook directory.")
+    recorded_hooks = manifest.get("managed_hooks_path")
+    if recorded_hooks != expected_hooks:
+        # The manifest names absolute paths, so it stops matching when the
+        # repository moves. Only its old location can uninstall it.
+        raise _RejectedManifest(
+            "The attribution install manifest points outside its managed hook directory.",
+            (
+                "Move the repository back so that its Git directory is "
+                f"{Path(recorded_hooks).parent.parent}, run joyride uninstall, move "
+                "it again, then run joyride install."
+            )
+            if isinstance(recorded_hooks, str)
+            else fix,
+        )
     return manifest
 
 
@@ -1343,6 +1459,95 @@ def _integration_record(
     return matches[0] if matches else None
 
 
+def _token_path(git_dir: Path) -> Path:
+    """Return the file that names one worktree's install.
+
+    It lives in the worktree's private Git directory, which Git deletes with
+    the worktree, so a later worktree that Git gives the same directory has no
+    token or a different one.
+    """
+
+    return git_dir / "attribution" / "worktree-id"
+
+
+def _worktree_token(git_dir: Path) -> str | None:
+    try:
+        return _token_path(git_dir).read_text(encoding="utf-8").strip() or None
+    except (OSError, UnicodeError):
+        return None
+
+
+def _prune_removed_worktrees(manifest: dict[str, Any]) -> set[str]:
+    """Drop the entries of worktrees that Git removed, and return their ids.
+
+    A worktree id is the worktree's private Git directory, which `git worktree
+    remove` and `git worktree prune` delete. Git gives a later worktree of the
+    same name the same directory, so an id whose recorded token no longer
+    matches is removed too. A worktree whose checkout is gone but whose Git
+    directory remains keeps its entries, because Git still lists it and its
+    checkout may be on a volume that is not mounted.
+    """
+
+    tokens = manifest.setdefault("worktree_tokens", {})
+    listed = {
+        *manifest["enabled_worktrees"],
+        *(item["worktree_id"] for item in manifest["integrations"]),
+        *tokens,
+    }
+    removed = {
+        item
+        for item in listed
+        if not Path(item).exists()
+        or (item in tokens and tokens[item] != _worktree_token(Path(item)))
+    }
+    manifest["enabled_worktrees"] = [
+        item for item in manifest["enabled_worktrees"] if item not in removed
+    ]
+    manifest["integrations"] = [
+        item for item in manifest["integrations"] if item["worktree_id"] not in removed
+    ]
+    for item in removed:
+        tokens.pop(item, None)
+    return removed
+
+
+def _orphaned_backups(
+    repository: _Repository, worktree_ids: list[str], manifest: dict[str, Any]
+) -> list[Path]:
+    """Return the backups of these worktrees that no remaining record names.
+
+    Only a worktree's own backup paths are considered, so no record, however
+    malformed, can make this delete another file.
+    """
+
+    named = {str(item.get("backup_path")) for item in manifest["integrations"]}
+    backups: list[Path] = []
+    for worktree_id in worktree_ids:
+        for harness in _INTEGRATION_PATHS:
+            backup = _backup_path(repository, worktree_id, harness)
+            try:
+                _safe_private_path(backup, repository)
+            except ValueError:
+                continue
+            if str(backup) not in named and backup.exists():
+                backups.append(backup)
+    return backups
+
+
+def _settle_removed_worktrees(
+    repository: _Repository, worktree_ids: set[str]
+) -> list[str]:
+    """Settle the capture state of removed worktrees; return any warnings."""
+
+    from .automation import abandon_worktree
+
+    warnings: list[str] = []
+    for worktree_id in sorted(worktree_ids):
+        result = abandon_worktree(repository.root, worktree_id)
+        warnings.extend(item for item in result["warnings"] if isinstance(item, str))
+    return warnings
+
+
 def _safe_private_path(path: Path, repository: _Repository) -> None:
     normalised = Path(os.path.abspath(path))
     if normalised != path:
@@ -1427,7 +1632,14 @@ def _manifest_bytes(manifest: dict[str, Any]) -> bytes:
     manifest["integrations"] = sorted(
         manifest["integrations"], key=lambda item: (item["worktree_id"], item["harness"])
     )
-    return _json_bytes(manifest)
+    data = _json_bytes(manifest)
+    if len(data) > MAX_CONFIG_BYTES:
+        raise ValueError(
+            f"The attribution install manifest would be larger than {MAX_CONFIG_BYTES:,} "
+            "bytes, so hooks would ignore it. Remove worktrees that you no longer use "
+            "with git worktree remove, then run joyride install again."
+        )
+    return data
 
 
 def _empty_status(path: Path, *, warning: str | None = None) -> dict[str, Any]:
@@ -1525,8 +1737,17 @@ def installation_status(repo: str | Path) -> dict[str, Any]:
     try:
         manifest = _load_manifest(repository)
     except (OSError, ValueError) as exc:
-        message = str(exc)
+        from .automation import _install_enabled
+
+        message = getattr(exc, "problem", str(exc))
+        # Hooks read the manifest through a gate that accepts some manifests
+        # that the installer refuses, such as one that is a symlink.
+        if not _install_enabled(repository.root)[0]:
+            message += " Hooks here record no sessions or commits."
         base["warnings"] = [message]
+        action = getattr(exc, "action", None)
+        if action is not None:
+            base["action"] = action
         for value in base["harnesses"].values():
             value.update(state="needs-attention", message=message)
         return base
@@ -1806,7 +2027,7 @@ def _install_worktree(
         and os.environ.get(_DISABLE_TELEMETRY_ENV) != "1"
     )
     worktree_id = str(repository.git_dir)
-    manifest = _load_manifest(repository)
+    manifest = _load_manifest(repository, oversized=True)
     active = bool(manifest and manifest["enabled_worktrees"])
     local_before = _local_hooks_path(repository)
     machine_git = (
@@ -1896,6 +2117,12 @@ def _install_worktree(
         }
 
     assert manifest is not None
+    # Pruning follows the active check above, so a manifest that lists only
+    # removed worktrees still owns the Git hooks that it installed. It precedes
+    # the integration records below, so a worktree that took a removed
+    # worktree's id never inherits its record.
+    removed = _prune_removed_worktrees(manifest)
+    orphaned = _orphaned_backups(repository, sorted(removed), manifest)
     _safe_private_path(repository.manifest_path, repository)
     _safe_private_path(repository.bootstrap_path, repository)
     _safe_private_path(repository.managed_hooks_path, repository)
@@ -2019,7 +2246,7 @@ def _install_worktree(
         if record is None:
             backup = _backup_path(repository, worktree_id, harness)
             _safe_private_path(backup, repository)
-            if backup.exists():
+            if backup.exists() and backup not in orphaned:
                 raise ValueError(f"A stale attribution backup already exists at {backup}.")
         elif raw is None and not record.get("created_file"):
             raise ValueError(f"Pre-existing native hook file was removed: {path}.")
@@ -2195,6 +2422,8 @@ def _install_worktree(
     manifest["exclude"] = exclude_record
     if worktree_id not in manifest["enabled_worktrees"]:
         manifest["enabled_worktrees"].append(worktree_id)
+    existing_token = _worktree_token(repository.git_dir)
+    manifest["worktree_tokens"][worktree_id] = existing_token or uuid.uuid4().hex
     manifest["proxy_hashes"] = {
         name: _sha256(payload) for name, payload in sorted(proxy_payloads.items())
     }
@@ -2225,12 +2454,25 @@ def _install_worktree(
     else:
         manifest.pop("git_hook_scope", None)
 
+    # Settle a removed worktree's captures before its entry goes, as an
+    # uninstall does, so that a worktree that takes its id inherits none.
+    _settle_removed_worktrees(repository, removed)
     transaction = _Transaction()
     config_changed = not machine_git and local_before != (
         True,
         str(repository.managed_hooks_path),
     )
     try:
+        # These go first, because a worktree with a removed worktree's id
+        # writes its own backup at the same path.
+        for backup in orphaned:
+            transaction.delete(backup, remove_empty_parent=True)
+        if existing_token is None:
+            transaction.write(
+                _token_path(repository.git_dir),
+                f"{manifest['worktree_tokens'][worktree_id]}\n".encode(),
+                mode=0o600,
+            )
         for (
             record,
             path,
@@ -2339,6 +2581,7 @@ def can_machine_enroll(repo: str | Path) -> bool:
         return False
 
 
+@_serialized
 def heal_worktree(repo: str | Path) -> bool:
     """Provision one enrolled clone from the machine-level install.
 
@@ -2352,7 +2595,7 @@ def heal_worktree(repo: str | Path) -> bool:
 
     machine = load_user_manifest()
     repository = _repository(repo)
-    if not _enrollable(machine, repository, _load_manifest(repository)):
+    if not _enrollable(machine, repository, _load_manifest(repository, oversized=True)):
         return False
     from .global_git_hooks import runs_machine_hooks
 
@@ -2365,6 +2608,7 @@ def heal_worktree(repo: str | Path) -> bool:
     return True
 
 
+@_serialized
 def adopt_machine_git_hooks(repo: str | Path) -> bool:
     """Move a clone from its own Git hook dispatcher to the machine Git hooks.
 
@@ -2458,6 +2702,7 @@ def _reinstall_user_scope(
     return status
 
 
+@_serialized
 def install_repo(
     repo: str | Path,
     *,
@@ -2474,7 +2719,7 @@ def install_repo(
 
     selected = _repository(repo)
     _validate_install_scope(selected)
-    existing = _load_manifest(selected)
+    existing = _load_manifest(selected, oversized=True)
     if existing is not None and _user_scope(existing) and existing["enabled_worktrees"]:
         from .user_install import load_user_manifest
 
@@ -2503,7 +2748,7 @@ def install_repo(
         worktrees = [_LinkedWorktree(selected, None)]
         discovery_warnings = []
 
-    before = _load_manifest(selected)
+    before = _load_manifest(selected, oversized=True)
     enabled_before = set(before["enabled_worktrees"]) if before is not None else set()
     newly_enabled: list[_Repository] = []
     try:
@@ -2721,11 +2966,17 @@ def _uninstall_worktree(repo: str | Path) -> dict[str, Any]:
     if manifest is None:
         return installation_status(repository.root)
     worktree_id = str(repository.git_dir)
-    if worktree_id not in manifest["enabled_worktrees"]:
+    # A removed worktree must not keep the shared Git hooks installed, so an
+    # uninstall here also drops removed worktrees when this one is not enabled.
+    removed = _prune_removed_worktrees(manifest)
+    enabled = worktree_id in manifest["enabled_worktrees"]
+    if not enabled and not removed:
         return installation_status(repository.root)
 
     records: list[dict[str, Any]] = []
-    native_targets = () if _user_scope(manifest) else _INTEGRATION_PATHS.items()
+    native_targets = (
+        () if _user_scope(manifest) or not enabled else _INTEGRATION_PATHS.items()
+    )
     for harness, relative in native_targets:
         record = _integration_record(manifest, worktree_id, harness)
         if (
@@ -2778,7 +3029,7 @@ def _uninstall_worktree(repo: str | Path) -> dict[str, Any]:
     # conservatively contaminate unrelated edits.
     from .automation import abandon_worktree
 
-    abandoned = abandon_worktree(repository.root)
+    abandoned = abandon_worktree(repository.root) if enabled else {}
     abandoned_count = abandoned.get("abandoned_captures", 0)
     if isinstance(abandoned_count, int) and abandoned_count:
         noun = "capture" if abandoned_count == 1 else "captures"
@@ -2788,6 +3039,7 @@ def _uninstall_worktree(repo: str | Path) -> dict[str, Any]:
         warnings.extend(
             item for item in abandon_warnings if isinstance(item, str) and item
         )
+    warnings.extend(_settle_removed_worktrees(repository, removed))
 
     transaction = _Transaction()
     config_restored = False
@@ -2808,6 +3060,7 @@ def _uninstall_worktree(repo: str | Path) -> dict[str, Any]:
             for item in manifest["integrations"]
             if item.get("worktree_id") != worktree_id
         ]
+        manifest["worktree_tokens"].pop(worktree_id, None)
 
         if last:
             _restore_exclude(
@@ -2847,11 +3100,9 @@ def _uninstall_worktree(repo: str | Path) -> dict[str, Any]:
             manifest.pop("bootstrap_sha256", None)
             manifest.pop("exclude", None)
 
-        for record in records:
-            backup = Path(str(record.get("backup_path", "")))
-            _safe_private_path(backup, repository)
-            if backup.exists():
-                transaction.delete(backup)
+        owners = sorted(removed) + ([worktree_id] if enabled else [])
+        for backup in _orphaned_backups(repository, owners, manifest):
+            transaction.delete(backup, remove_empty_parent=True)
         if last:
             exclude_backup = repository.state_dir / "backups" / "shared" / "info-exclude"
             _safe_private_path(exclude_backup, repository)
@@ -2904,6 +3155,7 @@ def _unregister_cost_telemetry_if_unused(
     return status
 
 
+@_serialized
 def uninstall_repo(
     repo: str | Path, *, all_worktrees: bool = True
 ) -> dict[str, Any]:
@@ -2925,6 +3177,10 @@ def uninstall_repo(
         for item in worktrees
         if str(item.repository.git_dir) in enabled
     ]
+    if not targets:
+        # Only removed or unreachable worktrees are enabled. Uninstalling here
+        # drops the removed ones, and the shared hooks go with the last one.
+        targets = [selected]
     removed: list[_Repository] = []
     operation_warnings: list[str] = []
     try:
@@ -2953,7 +3209,7 @@ def uninstall_repo(
         raise
 
     status = installation_status(selected.root)
-    unavailable_count = len(enabled) - len(targets)
+    unavailable_count = status["unavailable_enabled_worktree_count"]
     warnings = [*status["warnings"], *operation_warnings, *discovery_warnings]
     if unavailable_count:
         noun = "worktree" if unavailable_count == 1 else "worktrees"

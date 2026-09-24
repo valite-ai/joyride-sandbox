@@ -28,7 +28,14 @@ from .hook_client import clock
 from .hosted_runtime import WORKFLOW_PATH
 from .notes import _record_commit_locked
 from .runtime import system_subprocess_environment
-from .store import RepoPath, git_common_dir, git_dir, open_db, repository_root
+from .store import (
+    RepoPath,
+    git_common_dir,
+    git_dir,
+    open_db,
+    read_install_state,
+    repository_root,
+)
 
 
 SUPPORTED_HARNESSES = frozenset({"codex", "claude-code"})
@@ -1857,11 +1864,18 @@ def _handle_stop(
     )
 
 
-def abandon_worktree(repo: RepoPath) -> dict[str, object]:
-    """Settle all active capture state before one worktree is disabled."""
+def abandon_worktree(
+    repo: RepoPath, removed_id: str | None = None
+) -> dict[str, object]:
+    """Settle all active capture state before one worktree is disabled.
+
+    ``removed_id`` names a worktree that Git removed. Its state is settled
+    through ``repo``, a live worktree of the same repository, and its queued
+    commits are dropped, because only the removed worktree could publish them.
+    """
 
     root = repository_root(repo)
-    worktree_id = str(git_dir(root))
+    worktree_id = removed_id or str(git_dir(root))
     database_path = git_common_dir(root) / "attribution" / "ledger.sqlite3"
     if not database_path.is_file():
         return {
@@ -1900,7 +1914,7 @@ def abandon_worktree(repo: RepoPath) -> dict[str, object]:
         finally:
             connection.close()
 
-    recorded, warnings = _drain_pending(root, worktree_id)
+    recorded, warnings = ([], []) if removed_id else _drain_pending(root, worktree_id)
     dropped = 0
     with _worktree_lock(root, blocking=True):
         connection = open_db(root)
@@ -1948,12 +1962,11 @@ def _register_telemetry_session(
 
     if event not in {"SessionStart", "PreToolUse"}:
         return
-    state_path = git_common_dir(repo) / "attribution" / "install.json"
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        state = read_install_state(repo)
+    except (OSError, ValueError):
         return
-    if not isinstance(state, dict):
+    if state is None:
         return
     enabled = state.get("telemetry_enabled") is True
     if state.get("hook_scope") == "user":
@@ -2086,21 +2099,14 @@ def _heal_worktree(repo: Path) -> tuple[bool, str | None]:
 
 
 def _install_enabled(repo: Path) -> tuple[bool, str | None]:
-    state_path = git_common_dir(repo) / "attribution" / "install.json"
     try:
-        raw = state_path.read_bytes()
-    except FileNotFoundError:
-        return False, "Native attribution automation is not enabled for this worktree."
+        state = read_install_state(repo)
     except OSError as exc:
         return False, f"Could not read native automation state: {_warning(exc)}"
-    if len(raw) > 64 * 1024:
-        return False, "Native automation state is oversized and was ignored."
-    try:
-        state = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False, "Native automation state is malformed and was ignored."
-    if not isinstance(state, dict):
-        return False, "Native automation state has an unsupported format and was ignored."
+    except ValueError as exc:
+        return False, str(exc)
+    if state is None:
+        return False, "Native attribution automation is not enabled for this worktree."
     enabled_worktrees = state.get("enabled_worktrees")
     if state.get("version") != INSTALL_STATE_VERSION or not isinstance(enabled_worktrees, list):
         return False, "Native automation state has an unsupported format and was ignored."

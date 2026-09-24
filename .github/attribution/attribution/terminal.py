@@ -1931,7 +1931,10 @@ def render_status(
         output_width,
     )
     notice = safe_text(status.get("notice"))
-    if notice and status.get("installed") is True:
+    action = safe_text(status.get("action"))
+    if action:
+        _append_field(lines, "Repair", action, output_width, full=True)
+    elif notice and status.get("installed") is True:
         _append_field(lines, "Notice", notice, output_width)
     elif status.get("installed") is False and status.get("git_repository") is True:
         enable = (

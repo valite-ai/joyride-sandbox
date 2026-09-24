@@ -574,14 +574,13 @@ def _read_new_lines(
 def fallback_enabled(repo: Path) -> bool:
     """Return whether this checkout lets the fallback read session files."""
 
-    from .store import git_common_dir
+    from .store import read_install_state
 
-    state_path = git_common_dir(repo) / "attribution" / "install.json"
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError):
+        state = read_install_state(repo)
+    except (OSError, ValueError):
         return False
-    if not isinstance(state, dict) or state.get("usage_fallback") is False:
+    if state is None or state.get("usage_fallback") is False:
         return False
     # Either opt-out wins. A repository install's hooks defer to the machine
     # hooks, so the machine's choice governs a clone with either install.

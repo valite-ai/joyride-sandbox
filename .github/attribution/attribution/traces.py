@@ -19,7 +19,7 @@ import sqlite3
 from typing import Any
 
 from .activity import _SECRET_PREFIXES, _TOKEN_RE
-from .store import git_common_dir
+from .store import read_install_state
 
 
 TRACE_VERSION = 1
@@ -60,12 +60,11 @@ def traces_enabled(repo: Any) -> bool:
     written before the key existed keeps traces, and no manifest keeps none.
     """
 
-    state_path = git_common_dir(repo) / "attribution" / "install.json"
     try:
-        state = json.loads(state_path.read_bytes()[: 64 * 1024].decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        state = read_install_state(repo)
+    except (OSError, ValueError):
         return False
-    return isinstance(state, dict) and state.get("traces_enabled") is not False
+    return state is not None and state.get("traces_enabled") is not False
 
 
 def redact(text: str) -> str:
