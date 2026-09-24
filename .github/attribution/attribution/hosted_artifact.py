@@ -20,7 +20,13 @@ import unicodedata
 
 from .code import build_pr_code_file, list_pr_code_files
 from .cost_reasons import sanitize_reasons
-from .pr_report import build_pr_report, fallback_narrative
+from .pr_report import (
+    INSIGHT_EFFORT, INSIGHT_EVENT_KINDS, INSIGHT_FACT_FIELDS, INSIGHT_MODEL_COST_FIELDS,
+    INSIGHT_TIME, INSIGHT_TOKEN_FIELDS, INSIGHT_TOOL_CLASSES, INSIGHTS_VERSION, MAX_INSIGHT_COUNT,
+    MAX_INSIGHT_ID_CHARS, MAX_INSIGHT_LABEL_CHARS, MAX_INSIGHT_MODELS,
+    MAX_INSIGHT_SECONDS, MAX_INSIGHT_SESSIONS, MAX_INSIGHT_TIMELINE_ITEMS,
+    build_pr_report, fallback_narrative, insight_label,
+)
 from .runtime import system_subprocess_environment
 
 
@@ -43,8 +49,11 @@ _FORBIDDEN_KEYS = {
 }
 # The paragraph is display prose, not evidence, and a model drafts a different
 # one on every run. Keeping it out of the digest lets a re-run of the same
-# revision stay a retry instead of a conflict the hosted service rejects.
-_UNSIGNED_SUMMARY_KEYS = frozenset({"narrative_summary", "narrative_source"})
+# revision stay a retry instead of a conflict the hosted service rejects. The
+# insights are display data in the same way: a later push refreshes the session
+# facts of one head, and a newer runtime adds them to a revision an older one
+# published, so neither may change the digest the service stored.
+_UNSIGNED_SUMMARY_KEYS = frozenset({"narrative_summary", "narrative_source", "insights"})
 
 
 def canonical_json(value: Any) -> bytes:
@@ -59,7 +68,7 @@ def canonical_json(value: Any) -> bytes:
 
 
 def artifact_digest(value: dict[str, Any]) -> str:
-    """Digest an artifact without its ``digest`` member or its narrative prose."""
+    """Digest an artifact without its ``digest`` member or its display fields."""
     if not isinstance(value, dict):
         raise ValueError("Artifact must be an object.")
     unsigned = {key: item for key, item in value.items() if key != "digest"}
@@ -310,8 +319,14 @@ def build_artifact(
     notes: list[dict[str, Any]], tasks: list[dict[str, Any]],
     narrative_summary: str | None = None,
     usage: Mapping[str, Mapping[str, Any]] | None = None,
+    session_facts: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Precompute one immutable PR report and bounded code-history projection."""
+    """Precompute one immutable PR report and bounded code-history projection.
+
+    The summary always carries ``insights``. ``session_facts`` must already be
+    rebuilt through the footer's allowlist; without it, every local fact of
+    every session is null.
+    """
     root = Path(repo).expanduser().resolve()
     repo_id = str(repository_id)
     if not repo_id.isascii() or not repo_id.isdecimal() or repo_id.startswith("0") or repo_id == "0":
@@ -326,7 +341,7 @@ def build_artifact(
     owner, repository = full_name.split("/", 1)
     summary = build_pr_report(
         root, base_ref=base_sha, head_ref=head_sha, notes=notes, tasks=tasks,
-        usage=usage,
+        usage=usage, session_facts=session_facts or {},
     )
     # The paragraph is read from the structured narrative before that narrative
     # is dropped, so the hosted page keeps the account the PR no longer carries.
@@ -357,6 +372,11 @@ def build_artifact(
         "completeness": {"status": "complete", "partial_files": 0, "reasons": []},
     }
     partial_reasons: list[str] = []
+    # The encoded size of the artifact so far, kept by adding each member's
+    # own encoding, so the summary and its insights are encoded once rather
+    # than again for every file. Canonical JSON has no whitespace, so a member
+    # adds its key, a colon, its value, and a comma after the first one.
+    size = len(canonical_json(artifact))
     for index, record in enumerate(listing["files"]):
         path = record["path"]
         refs = _source_refs(record, merge_base, head_sha)
@@ -378,21 +398,23 @@ def build_artifact(
             except (OSError, ValueError) as exc:
                 reason = "Detailed code history is unavailable: " + str(exc)[:384]
                 projection = _stub(path, refs, reason, repository=repository, head=head_sha)
-        candidate = deepcopy(artifact)
-        candidate["files"][path] = projection
-        if len(canonical_json(candidate)) > MAX_ARTIFACT_BYTES:
+        member = len(canonical_json(path)) + 1 + bool(artifact["files"])
+        if size + member + len(canonical_json(projection)) > MAX_ARTIFACT_BYTES:
             reason = "Detailed code history was omitted to keep the artifact within its 3 MiB limit."
             projection = _stub(path, refs, reason, repository=repository, head=head_sha)
         if projection["completeness"]["status"] == "partial":
             partial_reasons.extend(projection["completeness"]["reasons"])
         artifact["files"][path] = projection
-        artifact["file_index"].append({
+        size += member + len(canonical_json(projection))
+        entry = {
             key: deepcopy(record.get(key))
             for key in (
                 "path", "status", "base_path", "head_path", "size",
                 "base_blob_sha", "head_blob_sha",
             )
-        } | {"completeness": deepcopy(projection["completeness"])})
+        } | {"completeness": deepcopy(projection["completeness"])}
+        size += len(canonical_json(entry)) + bool(artifact["file_index"])
+        artifact["file_index"].append(entry)
     partial_files = sum(
         item["completeness"]["status"] == "partial" for item in artifact["file_index"]
     )
@@ -458,6 +480,155 @@ def _validate_cost_reasons(record: Mapping[str, Any], label: str) -> None:
         raise ValueError(f"Artifact {label} proxy price marker is invalid.")
 
 
+_INSIGHT_COST_KEYS = frozenset({"reported_usd", *INSIGHT_MODEL_COST_FIELDS})
+_INSIGHT_SESSION_KEYS = frozenset({
+    "id", "actor_kind", "model", "harness", "effort", "role", "parent_session_id",
+    "started_at", "ended_at", "cost", "cost_in_parent", "requests", "committed_lines",
+    "head_lines", *INSIGHT_FACT_FIELDS,
+})
+_INSIGHT_MODEL_KEYS = frozenset({
+    "model", "effort", "requests", "tokens", *INSIGHT_MODEL_COST_FIELDS,
+})
+_ROLES = frozenset({"planning", "implementation", "testing", "review", "other"})
+
+
+def _insight_int(
+    value: Any, label: str, *, optional: bool = True, limit: int = MAX_INSIGHT_COUNT,
+) -> None:
+    if value is None and optional:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= limit:
+        raise ValueError(f"Artifact insights {label} is invalid.")
+
+
+def _insight_text(value: Any, label: str, pattern: re.Pattern[str]) -> None:
+    if value is not None and (not isinstance(value, str) or not pattern.fullmatch(value)):
+        raise ValueError(f"Artifact insights {label} is invalid.")
+
+
+def _insight_amounts(record: Mapping[str, Any], keys: Any, label: str) -> None:
+    for key in keys:
+        _nonnegative_number(record[key], f"insights {label}", optional=True)
+
+
+def _insight_tokens(value: Any, label: str) -> None:
+    tokens = _keys(value, set(INSIGHT_TOKEN_FIELDS), f"insights {label} tokens")
+    for count in tokens.values():
+        _insight_int(count, f"{label} tokens")
+
+
+def _validate_insight_session(value: Any) -> str:
+    record = _keys(
+        value, set(_INSIGHT_SESSION_KEYS), "insights session",
+        optional={"tokens", "by_model"},
+    )
+    if not insight_label(record["id"], MAX_INSIGHT_ID_CHARS):
+        raise ValueError("Artifact insights session ID is invalid.")
+    # Each value is type-checked before a membership test, which an unhashable
+    # value would otherwise turn into a TypeError instead of a refusal.
+    if (
+        not isinstance(record["actor_kind"], str) or record["actor_kind"] not in {"ai", "manual"}
+        or (record["role"] is not None and (
+            not isinstance(record["role"], str) or record["role"] not in _ROLES
+        ))
+        or type(record["cost_in_parent"]) is not bool
+    ):
+        raise ValueError("Artifact insights session classification is invalid.")
+    for key, limit in (
+        ("model", MAX_INSIGHT_LABEL_CHARS), ("harness", MAX_INSIGHT_LABEL_CHARS),
+        ("parent_session_id", MAX_INSIGHT_ID_CHARS),
+    ):
+        if record[key] is not None and not insight_label(record[key], limit):
+            raise ValueError(f"Artifact insights session {key} is invalid.")
+    _insight_text(record["effort"], "session effort", INSIGHT_EFFORT)
+    _insight_text(record["started_at"], "session start", INSIGHT_TIME)
+    _insight_text(record["ended_at"], "session end", INSIGHT_TIME)
+    cost = _keys(record["cost"], set(_INSIGHT_COST_KEYS), "insights session cost")
+    _insight_amounts(cost, _INSIGHT_COST_KEYS, "session cost")
+    for key in ("requests", *INSIGHT_FACT_FIELDS):
+        if key != "tool_calls":
+            _insight_int(record[key], f"session {key}")
+    for key in ("committed_lines", "head_lines"):
+        _insight_int(record[key], f"session {key}", optional=False)
+    if record["tool_calls"] is not None:
+        calls = _keys(record["tool_calls"], set(INSIGHT_TOOL_CLASSES), "insights session tool calls")
+        for count in calls.values():
+            _insight_int(count, "session tool calls", optional=False)
+    if "tokens" in record:
+        _insight_tokens(record["tokens"], "session")
+    if "by_model" in record:
+        models = record["by_model"]
+        if not isinstance(models, list) or not models or len(models) > MAX_INSIGHT_MODELS:
+            raise ValueError("Artifact insights session models are invalid.")
+        for item in models:
+            entry = _keys(item, set(_INSIGHT_MODEL_KEYS), "insights model usage")
+            if entry["model"] is not None and not insight_label(entry["model"]):
+                raise ValueError("Artifact insights model name is invalid.")
+            _insight_text(entry["effort"], "model effort", INSIGHT_EFFORT)
+            _insight_int(entry["requests"], "model requests")
+            _insight_amounts(entry, INSIGHT_MODEL_COST_FIELDS, "model cost")
+            _insight_tokens(entry["tokens"], "model")
+    return record["id"]
+
+
+def _validate_insight_timeline(value: Any) -> str:
+    timeline = _keys(value, {"session_id", "points", "events"}, "insights timeline")
+    points, events = timeline["points"], timeline["events"]
+    if (
+        not isinstance(points, list) or len(points) > MAX_INSIGHT_TIMELINE_ITEMS
+        or not isinstance(events, list) or len(events) > MAX_INSIGHT_TIMELINE_ITEMS
+    ):
+        raise ValueError("Artifact insights timeline is invalid.")
+    previous: list[Any] | None = None
+    for point in points:
+        if not isinstance(point, list) or len(point) != 2:
+            raise ValueError("Artifact insights timeline point is invalid.")
+        _insight_int(point[0], "timeline time", optional=False, limit=MAX_INSIGHT_SECONDS)
+        _nonnegative_number(point[1], "insights timeline cost")
+        # Time strictly increases and the cumulative cost never falls.
+        if previous is not None and (point[0] <= previous[0] or point[1] < previous[1]):
+            raise ValueError("Artifact insights timeline point is invalid.")
+        previous = point
+    last = 0
+    for item in events:
+        event = _keys(item, {"t", "kind"}, "insights timeline event")
+        _insight_int(event["t"], "timeline event time", optional=False, limit=MAX_INSIGHT_SECONDS)
+        kind = event["kind"]
+        if not isinstance(kind, str) or kind not in INSIGHT_EVENT_KINDS or event["t"] < last:
+            raise ValueError("Artifact insights timeline event is invalid.")
+        last = event["t"]
+    return timeline["session_id"]
+
+
+def _validate_insights(value: Any) -> None:
+    """Accept the per-session facts the insight graphs read, and nothing else.
+
+    The object is counts, amounts, times, and labels. It carries no text,
+    prompt, command, path, or locator, and each session appears once.
+    """
+    insights = _keys(value, {"version", "truncated", "sessions", "timelines"}, "insights")
+    if (
+        type(insights["version"]) is not int or insights["version"] != INSIGHTS_VERSION
+        or type(insights["truncated"]) is not bool
+        or not isinstance(insights["sessions"], list)
+        or len(insights["sessions"]) > MAX_INSIGHT_SESSIONS
+        or not isinstance(insights["timelines"], list)
+    ):
+        raise ValueError("Artifact insights are invalid.")
+    identifiers: set[str] = set()
+    for item in insights["sessions"]:
+        identifier = _validate_insight_session(item)
+        if identifier in identifiers:
+            raise ValueError("Artifact insights repeat a session.")
+        identifiers.add(identifier)
+    drawn: set[str] = set()
+    for item in insights["timelines"]:
+        identifier = _validate_insight_timeline(item)
+        if not isinstance(identifier, str) or identifier not in identifiers or identifier in drawn:
+            raise ValueError("Artifact insights timeline names an unknown session.")
+        drawn.add(identifier)
+
+
 def _validate_narrative(text: Any, origin: Any) -> None:
     """Accept one bounded paragraph with its source, or neither of them."""
     if text is None and origin is None:
@@ -500,7 +671,15 @@ def _nonnegative_int(value: Any, label: str, *, optional: bool = False) -> None:
 def _nonnegative_number(value: Any, label: str, *, optional: bool = False) -> None:
     if value is None and optional:
         return
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    try:
+        # An integer too large for a float raises here, and is refused like NaN.
+        valid = (
+            not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value) and value >= 0
+        )
+    except OverflowError:
+        valid = False
+    if not valid:
         raise ValueError(f"Artifact {label} must be a nonnegative finite number.")
 
 
@@ -703,9 +882,12 @@ def validate_artifact(value: Any, *, require_digest: bool = True) -> dict[str, A
         "session_count", "ai_session_count", "reported_cost_usd", "cost_complete",
         "total_tokens", "tokens_complete", "complete", "warnings",
     }, "summary", optional=set(_UNSIGNED_SUMMARY_KEYS) | _COST_REASON_KEYS | {
-        "estimated_cost_usd", "codex_credits", "codex_api_equivalent_usd",
+        "estimated_cost_usd", "codex_credits", "codex_api_equivalent_usd", "insights",
     })
     _validate_cost_reasons(summary, "summary")
+    # A runtime vendored before the insights existed writes no such key.
+    if "insights" in summary:
+        _validate_insights(summary["insights"])
     _validate_narrative(
         summary.get("narrative_summary"), summary.get("narrative_source")
     )

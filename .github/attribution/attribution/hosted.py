@@ -60,6 +60,9 @@ _WORKFLOW = """name: Coding attribution footer
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, edited]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -68,7 +71,7 @@ permissions:
 
 jobs:
   footer:
-    if: github.event.action != 'edited' || github.event.changes.base != null
+    if: github.event_name == 'pull_request_target' && (github.event.action != 'edited' || github.event.changes.base != null)
     concurrency:
       group: attribution-footer-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -90,6 +93,30 @@ jobs:
           ATTRIBUTION_UI_URL: ${{ vars.ATTRIBUTION_UI_URL }}
           ATTRIBUTION_OPENAI_API_KEY: ${{ secrets.ATTRIBUTION_OPENAI_API_KEY }}
         run: python3 -I -S -c "import sys; sys.dont_write_bytecode = True; sys.path.append('.github/attribution'); from attribution.github_footer import main; raise SystemExit(main())"
+  survival:
+    # Weekly, and only from the default branch: count how much merged PR code survives.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The run's SHA is the default-branch head. Blame needs its full history.
+      # PR heads and metadata snapshots are fetched as data, never run.
+      - name: Check out trusted workflow code and default-branch history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Measure merged code survival
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ATTRIBUTION_INGEST_URL: ${{ vars.ATTRIBUTION_INGEST_URL }}
+        run: python3 -I -S -c "import sys; sys.dont_write_bytecode = True; sys.path.append('.github/attribution'); from attribution.survival import main; raise SystemExit(main())"
 """
 
 

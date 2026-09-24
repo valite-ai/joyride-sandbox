@@ -22,6 +22,11 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .cost_reasons import sanitize_reasons
+from .pr_report import (
+    INSIGHT_EFFORT, INSIGHT_EVENT_KINDS, INSIGHT_FACT_FIELDS, INSIGHT_MODEL_COST_FIELDS,
+    INSIGHT_TOKEN_FIELDS, INSIGHT_TOOL_CLASSES, MAX_INSIGHT_COUNT, MAX_INSIGHT_ID_CHARS,
+    MAX_INSIGHT_MODELS, MAX_INSIGHT_SECONDS, MAX_INSIGHT_TIMELINE_ITEMS, insight_label,
+)
 from .runtime import system_subprocess_environment
 
 
@@ -47,7 +52,6 @@ _USAGE_ALLOCATIONS = frozenset({
 _MAX_USAGE_SESSIONS = 500
 _MAX_USAGE_MODELS = 8
 _MAX_USAGE_MODEL_CHARS = 120
-
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -417,7 +421,8 @@ def _usage_record(source: dict[str, Any]) -> dict[str, Any]:
         record["cost_complete"] = complete
     allocation = source.get("allocation")
     if allocation is not None:
-        if allocation not in _USAGE_ALLOCATIONS:
+        # A list here is unhashable, so the type is checked before membership.
+        if not isinstance(allocation, str) or allocation not in _USAGE_ALLOCATIONS:
             raise ValueError("Joyride usage carries an invalid allocation.")
         record["allocation"] = allocation
     # A malformed reason is dropped on its own: it explains a cost and must not
@@ -465,6 +470,125 @@ def _snapshot_usage(raw: Any) -> dict[str, dict[str, Any]]:
     return usage
 
 
+def _fact_count(value: Any, limit: int = MAX_INSIGHT_COUNT) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= limit:
+        raise ValueError("Joyride session facts carry an invalid count.")
+    return value
+
+
+def _fact_amount(value: Any) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        or not math.isfinite(value) or value < 0
+    ):
+        raise ValueError("Joyride session facts carry an invalid amount.")
+    return float(value)
+
+
+def _fact_effort(value: Any) -> str | None:
+    if value is not None and (not isinstance(value, str) or not INSIGHT_EFFORT.fullmatch(value)):
+        raise ValueError("Joyride session facts carry an invalid effort.")
+    return value
+
+
+def _fact_model_usage(source: Any) -> dict[str, Any]:
+    # Every untrusted value is type-checked before it is hashed or compared,
+    # because an unhashable value would otherwise raise past the caller.
+    tokens = source.get("tokens") if isinstance(source, dict) else None
+    model = source.get("model") if isinstance(source, dict) else None
+    if not isinstance(tokens, dict) or (model is not None and not insight_label(model)):
+        raise ValueError("Joyride session facts carry invalid model usage.")
+    return {
+        "model": model,
+        "effort": _fact_effort(source.get("effort")),
+        "requests": _fact_count(source.get("requests")),
+        **{field: _fact_amount(source.get(field)) for field in INSIGHT_MODEL_COST_FIELDS},
+        "tokens": {field: _fact_count(tokens.get(field)) for field in INSIGHT_TOKEN_FIELDS},
+    }
+
+
+def _fact_timeline(source: Any) -> dict[str, Any]:
+    """Rebuild one cost curve and its events, in order and within their caps."""
+    points = source.get("points") if isinstance(source, dict) else None
+    events = source.get("events") if isinstance(source, dict) else None
+    if (
+        not isinstance(points, list) or len(points) > MAX_INSIGHT_TIMELINE_ITEMS
+        or not isinstance(events, list) or len(events) > MAX_INSIGHT_TIMELINE_ITEMS
+    ):
+        raise ValueError("Joyride session facts carry an invalid timeline.")
+    curve: list[list[Any]] = []
+    for point in points:
+        if not isinstance(point, list) or len(point) != 2:
+            raise ValueError("Joyride session facts carry an invalid timeline.")
+        second = _fact_count(point[0], MAX_INSIGHT_SECONDS)
+        amount = _fact_amount(point[1])
+        if second is None or amount is None or (
+            curve and (second <= curve[-1][0] or amount < curve[-1][1])
+        ):
+            raise ValueError("Joyride session facts carry an invalid timeline.")
+        curve.append([second, amount])
+    marks: list[dict[str, Any]] = []
+    for event in events:
+        kind = event.get("kind") if isinstance(event, dict) else None
+        second = _fact_count(event.get("t"), MAX_INSIGHT_SECONDS) if isinstance(event, dict) else None
+        if (
+            second is None or not isinstance(kind, str) or kind not in INSIGHT_EVENT_KINDS
+            or (marks and second < marks[-1]["t"])
+        ):
+            raise ValueError("Joyride session facts carry an invalid timeline.")
+        marks.append({"t": second, "kind": kind})
+    return {"points": curve, "events": marks}
+
+
+def _fact_record(source: dict[str, Any]) -> dict[str, Any]:
+    record: dict[str, Any] = {"effort": _fact_effort(source.get("effort"))}
+    for field in INSIGHT_FACT_FIELDS:
+        if field != "tool_calls":
+            record[field] = _fact_count(source.get(field))
+    calls = source.get("tool_calls")
+    if calls is not None:
+        if not isinstance(calls, dict) or set(calls) != set(INSIGHT_TOOL_CLASSES):
+            raise ValueError("Joyride session facts carry invalid tool calls.")
+        calls = {name: _fact_count(calls[name]) for name in INSIGHT_TOOL_CLASSES}
+        if None in calls.values():
+            raise ValueError("Joyride session facts carry invalid tool calls.")
+    record["tool_calls"] = calls
+    models = source.get("by_model")
+    if models is not None:
+        if not isinstance(models, list) or not models or len(models) > MAX_INSIGHT_MODELS:
+            raise ValueError("Joyride session facts carry invalid model usage.")
+        record["by_model"] = [_fact_model_usage(item) for item in models]
+    if source.get("timeline") is not None:
+        record["timeline"] = _fact_timeline(source["timeline"])
+    return record
+
+
+def _snapshot_session_facts(raw: Any) -> dict[str, dict[str, Any]]:
+    """Return the session facts of a snapshot, dropping each one it may not carry.
+
+    Like the usage object, this one is optional beside the notes: a record
+    outside its published bounds is dropped on its own, and a whole object
+    that is not a map of records is ignored, so the footer still renders.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    facts: dict[str, dict[str, Any]] = {}
+    for session_id, source in raw.items():
+        if not insight_label(session_id, MAX_INSIGHT_ID_CHARS) or not isinstance(source, dict):
+            continue
+        try:
+            facts[session_id] = _fact_record(source)
+        except (ValueError, OverflowError):
+            continue
+        if len(facts) >= _MAX_USAGE_SESSIONS:
+            break
+    return facts
+
+
 def _read_traces(repo: Path, environment: dict[str, str], tree: str) -> list[dict[str, Any]]:
     """Return the valid traces of a snapshot's ``traces`` directory.
 
@@ -508,7 +632,8 @@ def _read_traces(repo: Path, environment: dict[str, str], tree: str) -> list[dic
 def _read_snapshot(
     repo: Path, environment: dict[str, str], commit: str, head: str
 ) -> tuple[
-    list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]
+    list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]],
+    list[dict[str, Any]], dict[str, dict[str, Any]],
 ]:
     tree = _git(repo, environment, "ls-tree", "-z", commit).stdout
     entries = []
@@ -551,7 +676,10 @@ def _read_snapshot(
         or any(not isinstance(task, dict) for task in payload.get("tasks", []))
     ):
         raise ValueError("Joyride metadata does not match this PR head.")
-    return payload["notes"], payload.get("tasks", []), _snapshot_usage(payload.get("usage")), traces
+    return (
+        payload["notes"], payload.get("tasks", []), _snapshot_usage(payload.get("usage")),
+        traces, _snapshot_session_facts(payload.get("session_facts")),
+    )
 
 
 def _report_and_artifact_for_pr(
@@ -588,7 +716,7 @@ def _report_and_artifact_for_pr(
         fetched = _git(repo, environment, "rev-parse", "refs/attribution/metadata^{commit}").stdout.decode().strip()
         if fetched != metadata_commit:
             raise ValueError("Joyride metadata changed while it was being fetched.")
-        notes, tasks, usage, traces = _read_snapshot(repo, environment, fetched, head)
+        notes, tasks, usage, traces, session_facts = _read_snapshot(repo, environment, fetched, head)
         _git(repo, environment, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", base_url, f"{base}:refs/attribution/base")
         _git(repo, environment, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", head_url, f"{head}:refs/attribution/head")
         with _report_git_environment(environment):
@@ -611,7 +739,7 @@ def _report_and_artifact_for_pr(
                 repo, repository_id=repository_id, full_name=full_name,
                 pr_number=pr["number"], base_sha=base, head_sha=head,
                 metadata_sha=fetched, notes=notes, tasks=tasks,
-                narrative_summary=narrative, usage=usage,
+                narrative_summary=narrative, usage=usage, session_facts=session_facts,
             )
         return report, artifact, traces
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import math
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
@@ -407,6 +408,77 @@ def _weighted_targets(routes: Counter[str], valid: set[str]) -> dict[str, float]
     }
 
 
+# The event fields a record keeps for each model and effort, by the names the
+# totals beside them use.
+_DETAIL_FIELDS = {
+    "cost_usd": "estimated_cost_usd",
+    "credits": "codex_credits",
+    "codex_api_equivalent_usd": "codex_api_equivalent_usd",
+    "input_tokens": "input_tokens",
+    "cached_input_tokens": "cached_input_tokens",
+    "cache_creation_input_tokens": "cache_creation_input_tokens",
+    "output_tokens": "output_tokens",
+}
+
+
+def _effort(value: Any) -> str | None:
+    """Return the effort one request names as a short lowercase word, or None.
+
+    A value outside that shape names no effort a report can print, so it is
+    counted with the requests that named none.
+    """
+    if not isinstance(value, str):
+        return None
+    folded = value.strip().casefold()
+    return folded if re.fullmatch(r"[a-z]{1,16}", folded) else None
+
+
+def _record_detail(
+    usage: dict[str, Any],
+    raw_event: Mapping[str, Any],
+    values: Mapping[str, Any],
+    weight: float,
+    is_request: bool,
+) -> None:
+    """Keep one request's share by model and effort, and when it was priced.
+
+    A field no request of a model reported stays None rather than a zero.
+    """
+    model = raw_event.get("model")
+    key = (model if isinstance(model, str) and model else None, _effort(raw_event.get("effort")))
+    entry = usage["_by_model"].setdefault(
+        key, {"request_count": 0.0, **dict.fromkeys(_DETAIL_FIELDS.values())}
+    )
+    if is_request:
+        entry["request_count"] += weight
+    for field, name in _DETAIL_FIELDS.items():
+        number = _number(values.get(field))
+        if number is not None:
+            entry[name] = (entry[name] or 0.0) + number * weight
+    cost = _number(values.get("cost_usd"))
+    if cost is not None:
+        observed = raw_event.get("observed_at_unix_nano")
+        usage["_priced"].append(
+            (observed if type(observed) is int else None, cost * weight)
+        )
+
+
+def _detail(usage: dict[str, Any]) -> None:
+    """Round the kept detail as the totals beside it are rounded."""
+    entries = []
+    for (model, effort), entry in sorted(
+        usage.pop("_by_model").items(),
+        key=lambda item: (item[0][0] or "", item[0][1] or ""),
+    ):
+        rounded: dict[str, Any] = {"model": model, "effort": effort}
+        for name, value in entry.items():
+            places = 10 if name.endswith("_usd") or name == "codex_credits" else 3
+            rounded[name] = None if value is None else round(value, places)
+        entries.append(rounded)
+    usage["by_model"] = entries
+    usage["priced_requests"] = usage.pop("_priced")
+
+
 def unpriced_request_counts(events: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     """Count the requests that the current prices cannot price, by reason.
 
@@ -432,6 +504,7 @@ def allocate_session_usage(
     *,
     events: list[dict[str, Any]] | None = None,
     prompt_tool_links: list[dict[str, Any]] | None = None,
+    detail: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Allocate deduplicated usage events without counting one event twice.
 
@@ -443,6 +516,11 @@ def allocate_session_usage(
     turn ID. If an exporter does not expose either link, an event is allocated
     within its native session by completed capture count. The returned
     ``allocation`` value makes these distinctions visible to callers.
+
+    With ``detail``, each record also carries ``by_model``, its share of the
+    same totals for each model and effort, and ``priced_requests``, the
+    observed time and estimated dollars of each priced request it holds. The
+    totals themselves are the same either way.
     """
 
     common = Path(common_dir).resolve()
@@ -619,6 +697,7 @@ def allocate_session_usage(
                     "has_usd": False,
                     "has_credits": False,
                     "has_equivalent_usd": False,
+                    **({"_by_model": {}, "_priced": []} if detail else {}),
                 },
             )
             for field in numeric_fields:
@@ -658,6 +737,8 @@ def allocate_session_usage(
                 # The usage came from the session file, not from telemetry.
                 usage["sources"].add(TRANSCRIPT_USAGE_SOURCE)
             usage["allocations"].add(allocation)
+            if detail:
+                _record_detail(usage, raw_event, event_values, weight, is_request)
 
     result: dict[str, dict[str, Any]] = {}
     for session_id, usage in totals.items():
@@ -710,6 +791,8 @@ def allocate_session_usage(
         usage["allocation"] = (
             next(iter(allocations)) if len(allocations) == 1 else "mixed"
         )
+        if detail:
+            _detail(usage)
         result[session_id] = usage
     return result
 

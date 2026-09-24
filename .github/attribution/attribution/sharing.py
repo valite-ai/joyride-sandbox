@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import time
 from typing import Any, TextIO
 
 from .cost_reasons import is_proxy_priced, sanitize_reasons
@@ -102,6 +103,9 @@ _MAX_USAGE_MODEL_CHARS = 120
 # One push publishes usage for no more agents than one workflow object may
 # name, so the map cannot grow past a bound the snapshot already obeys.
 _MAX_USAGE_SESSIONS = _MAX_WORKFLOW_AGENTS
+# Reading the edits of the sessions a push describes must never hold the push
+# for long, so past this many seconds their generated lines stay unknown.
+_FACTS_SECONDS = 2.0
 
 
 def snapshot_ref(head: str) -> str:
@@ -674,9 +678,9 @@ def sanitize_usage(raw: Any) -> dict[str, Any] | None:
 
 
 def _snapshot_usage(
-    root: Path, notes: list[dict[str, Any]], tasks: list[dict[str, Any]]
-) -> dict[str, dict[str, Any]]:
-    """Return the telemetry this clone allocated to the sessions it publishes.
+    root: Path, head: str, notes: list[dict[str, Any]], tasks: list[dict[str, Any]]
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return the telemetry and the session facts of the sessions this clone publishes.
 
     A note records what the harness reported, and a headless session reports no
     model and no cost. The provider spool of that same run priced every request
@@ -693,7 +697,7 @@ def _snapshot_usage(
                 seen.add(session["id"])
                 named.append(session["id"])
     if not named:
-        return {}
+        return {}, {}
     try:
         # Imported here so an ordinary push loads the ledger reader only when
         # there are sessions to price.
@@ -702,7 +706,7 @@ def _snapshot_usage(
 
         common = git_common_dir(root)
         allocated = allocate_session_usage(
-            common, _load_local_sessions(common, _Warnings())
+            common, _load_local_sessions(common, _Warnings()), detail=True
         )
     except Exception:
         # Telemetry is optional evidence, so a spool this push cannot read
@@ -712,7 +716,7 @@ def _snapshot_usage(
             "the PR footer may not show a cost.",
             file=sys.stderr,
         )
-        return {}
+        allocated = {}
     usage: dict[str, dict[str, Any]] = {}
     for identifier in named:
         record = sanitize_usage(allocated.get(identifier))
@@ -721,7 +725,133 @@ def _snapshot_usage(
         usage[identifier] = record
         if len(usage) >= _MAX_USAGE_SESSIONS:
             break
-    return usage
+    return usage, _snapshot_facts(root, head, notes, tasks, allocated)
+
+
+def _default_branch_refs(root: Path) -> list[str]:
+    """Return the remote-tracking refs that name the default branch, if any are known."""
+    listed = _git(root, "for-each-ref", "--format=%(refname) %(symref)", "refs/remotes")
+    rows = [line.partition(" ") for line in listed.stdout.decode("utf-8", "replace").splitlines()]
+    named = [target for name, _space, target in rows if name.endswith("/HEAD") and target]
+    names = {name for name, _space, _target in rows}
+    return named or [
+        name for name in ("refs/remotes/origin/main", "refs/remotes/origin/master")
+        if name in names
+    ]
+
+
+def _fact_sessions(
+    root: Path, head: str, notes: list[dict[str, Any]], tasks: list[dict[str, Any]],
+    allocated: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return the named sessions in the order the insights of a pull request rank them.
+
+    The sessions of commits that are not on the default branch come first,
+    because those commits are the pull request; the other sessions of their
+    tasks join them unless a default-branch commit names them. Within each
+    group the most expensive session comes first, the order the artifact itself
+    keeps. Where no default branch is known, cost alone decides.
+    """
+    from .pr_report import insight_dollars, insight_order
+
+    sessions: dict[str, dict[str, Any]] = {}
+    for record in (*notes, *tasks):
+        for session in record["sessions"]:
+            sessions.setdefault(session["id"], session)
+    refs = _default_branch_refs(root)
+    own = set(
+        _git(root, "rev-list", head, "--not", *refs).stdout.decode("ascii").split()
+    ) if refs else None
+    named = {
+        on_branch: {
+            session["id"] for note in notes
+            if (own is None or note["commit"] in own) == on_branch
+            for session in note["sessions"]
+        }
+        for on_branch in (True, False)
+    }
+    pull = set(named[True])
+    worked = {sessions[identifier]["task_id"] for identifier in pull} - {None}
+    pull.update(
+        session["id"] for task in tasks if task["id"] in worked
+        for session in task["sessions"] if session["id"] not in named[False]
+    )
+
+    def rank(identifier: str) -> tuple[Any, ...]:
+        usage = allocated.get(identifier) or {}
+        dollars = insight_dollars(
+            sessions[identifier].get("cost_usd"), usage.get("estimated_cost_usd"),
+            usage.get("codex_api_equivalent_usd"),
+        )
+        return (identifier not in pull, *insight_order(dollars, identifier))
+
+    return sorted(sessions, key=rank)
+
+
+def _commit_times(root: Path, commits: set[str]) -> dict[str, int]:
+    """Return the committer time of each commit, in seconds since the epoch."""
+    if not commits:
+        return {}
+    listed = _git(root, "log", "--no-walk=unsorted", "--format=%H %ct", "--stdin",
+                  input_bytes=("\n".join(sorted(commits)) + "\n").encode())
+    return {
+        commit: int(seconds)
+        for commit, _space, seconds in (
+            line.partition(" ") for line in listed.stdout.decode("ascii").splitlines()
+        )
+    }
+
+
+def _snapshot_facts(
+    root: Path, head: str, notes: list[dict[str, Any]], tasks: list[dict[str, Any]],
+    allocated: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Return how the sessions of this pull request went, as this clone's ledger recorded it.
+
+    The hosted insights read these counts and times beside the notes, for at
+    most as many sessions as an artifact keeps, ranked as it ranks them. A
+    ledger this push cannot read leaves the snapshot without the map rather
+    than failing the push, and the edits of the sessions are read within a
+    fixed time budget.
+    """
+    if not (git_common_dir(root) / "attribution" / "ledger.sqlite3").is_file():
+        return {}
+    facts: dict[str, dict[str, Any]] = {}
+    try:
+        from .pr_report import MAX_INSIGHT_SESSIONS
+        from .session_facts import session_facts
+
+        deadline = time.monotonic() + _FACTS_SECONDS
+        connection = open_db(root)
+        try:
+            recorded = {row[0] for row in connection.execute("SELECT id FROM sessions")}
+            chosen = [
+                identifier for identifier in _fact_sessions(root, head, notes, tasks, allocated)
+                if identifier in recorded
+            ][:MAX_INSIGHT_SESSIONS]
+            commits: dict[str, list[str]] = {}
+            for note in notes:
+                for session_id in set(note["contributing_session_ids"]) & set(chosen):
+                    commits.setdefault(session_id, []).append(note["commit"])
+            times = _commit_times(root, {sha for shas in commits.values() for sha in shas})
+            for identifier in chosen:
+                record = session_facts(
+                    connection, identifier, allocated.get(identifier),
+                    [times[sha] for sha in commits.get(identifier, ()) if sha in times],
+                    deadline,
+                )
+                if record is not None:
+                    facts[identifier] = record
+        finally:
+            connection.close()
+    except Exception:
+        print(
+            "Joyride: local session facts could not be read; "
+            "the hosted insights may be incomplete.",
+            file=sys.stderr,
+        )
+        return {}
+    return facts
 
 
 def _reachable_commits(repo: Path, head: str) -> list[str]:
@@ -878,11 +1008,34 @@ def build_snapshot(repo: str | Path, head: str, *, record_missing: bool = True) 
     }
     # A snapshot of a push with no telemetry keeps the exact bytes it had
     # before this object existed, so the key appears only where usage does.
-    usage = _snapshot_usage(root, notes, list(tasks.values()))
+    # The session facts likewise appear only where this clone recorded them.
+    usage, facts = _snapshot_usage(root, head, notes, list(tasks.values()))
     if usage:
         payload["usage"] = usage
-    snapshot = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+    if facts:
+        payload["session_facts"] = facts
+    return _encode_snapshot(payload)
+
+
+def _encode_snapshot(payload: dict[str, Any]) -> bytes:
+    """Encode one snapshot within its limit, giving up optional facts first.
+
+    The session facts are optional beside the evidence, and their timelines are
+    the largest part of them, so those go first and then the facts themselves.
+    """
+    def encoded() -> bytes:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False).encode()
+
+    snapshot = encoded()
+    facts = payload.get("session_facts")
+    if len(snapshot) > MAX_SNAPSHOT_BYTES and facts:
+        for record in facts.values():
+            record.pop("timeline", None)
+        snapshot = encoded()
+        if len(snapshot) > MAX_SNAPSHOT_BYTES:
+            del payload["session_facts"]
+            snapshot = encoded()
     if len(snapshot) > MAX_SNAPSHOT_BYTES:
         raise ValueError("Joyride snapshot exceeds 8 MiB")
     return snapshot
@@ -934,23 +1087,39 @@ def build_traces(repo: str | Path, snapshot: bytes) -> dict[str, bytes]:
     return traces
 
 
-def _snapshot_evidence(raw: bytes) -> tuple[bytes, bool] | None:
-    """Return a snapshot without its telemetry, and whether it carried any.
+_OPTIONAL_SNAPSHOT_KEYS = ("usage", "session_facts")
+
+
+def _refreshed_snapshot(published: bytes, snapshot: bytes) -> bytes | None:
+    """Return the published snapshot with this push's telemetry and facts merged in.
 
     The notes and tasks of a snapshot are evidence one push publishes exactly
-    once. The telemetry beside them is optional, so two snapshots of one head
-    are the same publication when everything but that object matches.
+    once, so a snapshot whose evidence differs from the published one returns
+    None. The usage and the session facts beside them are optional and merge by
+    session: this push's record of a session replaces the published one, and a
+    session only the published snapshot names, which another clone pushed or
+    this push could not read, keeps its record.
     """
     try:
-        payload = json.loads(raw)
+        earlier, current = json.loads(published), json.loads(snapshot)
     except ValueError:
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(earlier, dict) or not isinstance(current, dict):
         return None
-    usage = payload.pop("usage", None)
-    evidence = json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False).encode()
-    return evidence, bool(usage)
+
+    def evidence(payload: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in payload.items() if key not in _OPTIONAL_SNAPSHOT_KEYS}
+
+    if evidence(earlier) != evidence(current):
+        return None
+    for key in _OPTIONAL_SNAPSHOT_KEYS:
+        merged = {
+            **(earlier.get(key) if isinstance(earlier.get(key), dict) else {}),
+            **current.get(key, {}),
+        }
+        if merged:
+            current[key] = merged
+    return _encode_snapshot(current)
 
 
 def _published_snapshot(
@@ -974,13 +1143,11 @@ def _published_snapshot(
     return commit, published.stdout
 
 
-def share_snapshot(repo: str | Path, head: str, remote: str) -> str:
-    root = repository_root(repo)
-    reference = snapshot_ref(head)
-    snapshot = build_snapshot(root, head)
+def _metadata_commit(
+    root: Path, snapshot: bytes, traces: dict[str, bytes], environment: dict[str, str]
+) -> str:
     blob = _git(root, "hash-object", "-w", "--stdin", input_bytes=snapshot).stdout.decode().strip()
     entries = [f"100644 blob {blob}\tattribution.json"]
-    traces = build_traces(root, snapshot)
     if traces:
         trace_entries = []
         for session_id, body in sorted(traces.items()):
@@ -989,6 +1156,15 @@ def share_snapshot(repo: str | Path, head: str, remote: str) -> str:
         trace_tree = _git(root, "mktree", input_bytes=("\n".join(trace_entries) + "\n").encode()).stdout.decode().strip()
         entries.append(f"040000 tree {trace_tree}\ttraces")
     tree = _git(root, "mktree", input_bytes=("\n".join(entries) + "\n").encode()).stdout.decode().strip()
+    return _git(root, "-c", "commit.gpgsign=false", "commit-tree", tree,
+                input_bytes=b"PR attribution metadata\n", environment=environment).stdout.decode().strip()
+
+
+def share_snapshot(repo: str | Path, head: str, remote: str) -> str:
+    root = repository_root(repo)
+    reference = snapshot_ref(head)
+    snapshot = build_snapshot(root, head)
+    traces = build_traces(root, snapshot)
     environment = os.environ.copy()
     environment.update({
         "GIT_AUTHOR_NAME": "Joyride metadata", "GIT_AUTHOR_EMAIL": "attribution@localhost",
@@ -996,8 +1172,7 @@ def share_snapshot(repo: str | Path, head: str, remote: str) -> str:
         "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
         "GIT_TERMINAL_PROMPT": "0", _GUARD: "1",
     })
-    metadata_commit = _git(root, "-c", "commit.gpgsign=false", "commit-tree", tree,
-                           input_bytes=b"PR attribution metadata\n", environment=environment).stdout.decode().strip()
+    metadata_commit = _metadata_commit(root, snapshot, traces, environment)
     # No local ref mutation. Parentless, deterministic metadata commits make
     # each exact-head ref repeat exactly once its evidence has been published.
     pushed = _git(root, "push", "--no-verify", "--porcelain", "--", remote,
@@ -1007,16 +1182,18 @@ def share_snapshot(repo: str | Path, head: str, remote: str) -> str:
         # provider prices the requests of a session after the push that carried
         # its commit, so a headless session that reported no model and no cost
         # would keep an unknown footer for good. Refresh the ref where the notes
-        # and the tasks are byte-identical and only the telemetry beside them
-        # arrived, and never replace published telemetry with none.
+        # and the tasks are byte-identical, merging the telemetry and the session
+        # facts by session, so neither is ever replaced with none.
         published = _published_snapshot(root, remote, reference, environment)
-        evidence, carries_usage = _snapshot_evidence(snapshot)
-        earlier = None if published is None else _snapshot_evidence(published[1])
-        if earlier is None or earlier[0] != evidence or not carries_usage:
+        merged = None if published is None else _refreshed_snapshot(published[1], snapshot)
+        if merged is None:
             raise ValueError("Joyride Git operation failed: push")
+        if merged == published[1]:
+            return reference
+        refreshed = _metadata_commit(root, merged, traces, environment)
         _git(root, "push", "--no-verify", "--porcelain",
              f"--force-with-lease={reference}:{published[0]}", "--", remote,
-             f"{metadata_commit}:{reference}", environment=environment)
+             f"{refreshed}:{reference}", environment=environment)
     return reference
 
 

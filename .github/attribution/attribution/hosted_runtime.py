@@ -32,6 +32,7 @@ _REQUIRED_MODULES = frozenset(
         "narrative_summary.py",
     "traces.py",
         "runtime.py",
+        "survival.py",
         "tool_capture.py",
     }
 )

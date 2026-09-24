@@ -12,8 +12,8 @@ import sqlite3
 from typing import Any, Mapping
 
 from .cost_reasons import add_reasons, describe, is_proxy_priced, limit_reasons
-from .costing import allocate_session_usage
-from .harnesses import harness_display_name
+from .costing import _effort, allocate_session_usage
+from .harnesses import canonical_harness_id, harness_display_name
 from .notes import _blame, _blob_content, _changed_files, _tree, record_commit
 from .report import (
     _Warnings, _decode_git_path, _load_local_sessions, _load_notes,
@@ -38,6 +38,52 @@ _MAX_LINES = 500_000
 _MAX_NARRATIVE_AGENTS = 12
 _MAX_NARRATIVE_GROUPS = 6
 _MAX_NARRATIVE_FILES = 5
+# The insight graphs of the hosted page read one record for each session of a
+# pull request. ``hosted_artifact`` validates the object against these bounds.
+INSIGHTS_VERSION = 1
+MAX_INSIGHT_SESSIONS = 100
+MAX_INSIGHT_MODELS = 8
+MAX_INSIGHT_TIMELINE_ITEMS = 48
+MAX_INSIGHT_COUNT = 10**15
+MAX_INSIGHT_SECONDS = 10**9
+MAX_INSIGHT_ID_CHARS = 2048
+MAX_INSIGHT_LABEL_CHARS = 120
+# The insights sit in the summary, ahead of the file projections that share the
+# artifact's limit, so they are bounded well below it.
+MAX_INSIGHT_BYTES = 256 * 1024
+INSIGHT_EVENT_KINDS = frozenset({
+    "prompt", "interrupt", "compaction", "tool_failure", "retry_loop", "commit",
+})
+INSIGHT_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
+INSIGHT_EFFORT = re.compile(r"[a-z]{1,16}")
+# The tool classes a session counts, pinned as a published schema is: a ledger
+# that later learns a class must not change what an artifact may carry.
+INSIGHT_TOOL_CLASSES = (
+    "read", "search", "edit", "write", "shell", "web", "skill", "mcp", "agent",
+    "ask_user", "other",
+)
+INSIGHT_FACT_FIELDS = (
+    "prompts", "interrupts", "compactions", "tool_calls", "failed_tool_calls",
+    "retry_loops", "repeated_reads", "generated_lines",
+)
+# A session row counts prompts, interrupts, and compactions from zero, so a
+# zero is a measurement only where the capture sent that event. These are the
+# harnesses whose installed hooks send each one; a test pins them to
+# ``install._EVENTS``.
+INSIGHT_REPORTED_COUNTS = {
+    "prompts": frozenset({"claude-code", "codex"}),
+    "interrupts": frozenset({"codex"}),
+    "compactions": frozenset({"claude-code", "codex"}),
+}
+# What one model and effort of a session cost, beside the reported cost the
+# session itself records.
+INSIGHT_MODEL_COST_FIELDS = ("estimated_usd", "codex_credits", "codex_api_equivalent_usd")
+INSIGHT_TOKEN_FIELDS = {
+    "input": "input_tokens",
+    "cached_input": "cached_input_tokens",
+    "cache_creation_input": "cache_creation_input_tokens",
+    "output": "output_tokens",
+}
 
 
 def _scope(repo: Path, base_ref: str, head_ref: str) -> tuple[str, str, str, list[str]]:
@@ -79,7 +125,9 @@ def _positions(patch: str) -> dict[str, set[int]]:
                 raise ValueError("Invalid PR diff hunk")
             continue
         if line.startswith("+++ "):
-            value = _decode_git_path(line[4:])
+            # Git ends the header with a tab when an unquoted path holds a
+            # space; a quoted path spells any tab of its own as an escape.
+            value = _decode_git_path(line[4:].removesuffix("\t"))
             path = value[2:] if value.startswith("b/") else None
         match = _HUNK.match(line)
         if match:
@@ -316,11 +364,187 @@ def _usage_tokens(usage: Mapping[str, Any]) -> int | None:
     return int(round(counted))
 
 
+def insight_label(value: Any, limit: int = MAX_INSIGHT_LABEL_CHARS) -> bool:
+    """Say whether a label or identifier can be published in the insights."""
+    return (
+        isinstance(value, str) and bool(value.strip()) and len(value) <= limit
+        and not any(character < " " or character == "\x7f" for character in value)
+        and not any("\ud800" <= character <= "\udfff" for character in value)
+    )
+
+
+def insight_dollars(reported: Any, estimated: Any, equivalent: Any) -> float | None:
+    """Return the dollars a session is ranked by: reported, else estimated, else the
+    API equivalent of its credits, or None where it has no dollar cost."""
+    return next((
+        amount for amount in (_amount(reported), _amount(estimated), _amount(equivalent))
+        if amount is not None
+    ), None)
+
+
+def insight_order(dollars: float | None, session_id: str) -> tuple[Any, ...]:
+    """Rank sessions the one way the snapshot and the artifact both keep them:
+    the most expensive first, an unknown cost last, then by ID."""
+    return (dollars is None, -(dollars or 0.0), session_id)
+
+
+def insight_reported_count(value: Any, field: str, harness: Any) -> int | None:
+    """Return a prompt, interrupt, or compaction count, or None where it is unknown.
+
+    A positive count was observed. A zero is known only for a native hook
+    session of a harness whose hooks send that event; the caller passes None
+    for a harness it cannot name so.
+    """
+    if type(value) is not int or not 0 <= value <= MAX_INSIGHT_COUNT:
+        return None
+    return value if value or harness in INSIGHT_REPORTED_COUNTS[field] else None
+
+
+def _insight_count(value: Any) -> int | None:
+    number = _amount(value)
+    return None if number is None or number > MAX_INSIGHT_COUNT else int(round(number))
+
+
+def _canonical_harness(value: Any) -> Any:
+    """Return the ID of a known harness, or the label a session recorded."""
+    try:
+        return canonical_harness_id(value)
+    except ValueError:
+        return value
+
+
+def _encoded_size(value: Any) -> int:
+    return len(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode())
+
+
+def _note_facts(session: Mapping[str, Any], activity: Mapping[str, Any], harness: Any) -> dict[str, Any]:
+    """Return the facts the notes themselves record for a session no clone shared.
+
+    A count the harness never reports stays unknown, as it does in a clone's
+    own facts, and the notes name no failure, loop, read, or edit.
+    """
+    calls = activity.get("tool_calls")
+    return {
+        **{
+            field: insight_reported_count(session.get(f"{field[:-1]}_count"), field, harness)
+            for field in INSIGHT_REPORTED_COUNTS
+        },
+        "tool_calls": (
+            {name: calls.get(name, 0) for name in INSIGHT_TOOL_CLASSES}
+            if isinstance(calls, Mapping) and not session.get("activity_truncated") else None
+        ),
+    }
+
+
+def _insights(
+    members: set[str],
+    sessions: Mapping[str, Mapping[str, Any]],
+    usage: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    harnesses: Mapping[str, Any],
+    activity: Mapping[str, Mapping[str, Any]],
+    committed: Mapping[str, int],
+    head: Mapping[str, int],
+) -> dict[str, Any]:
+    """Return one record for each session of this PR, for the insight graphs.
+
+    The notes say who each session was and which lines its commits carried,
+    the blame of the head says which lines it still owns, the allocated usage
+    says what it cost, and ``facts`` holds what the ledger of the clone that ran
+    it recorded, already rebuilt by the caller. A session no clone shared facts
+    for keeps what its notes record and nothing more: nothing here is guessed.
+    Past the caps, the most expensive sessions are kept, their timelines go
+    before any session does, and the object says it was truncated.
+    """
+    ranked = []
+    skipped = False
+    for session_id in members:
+        if not insight_label(session_id, MAX_INSIGHT_ID_CHARS):
+            skipped = True
+            continue
+        session = sessions[session_id]
+        allocated = usage.get(session_id)
+        allocated = allocated if isinstance(allocated, Mapping) else {}
+        harness = _canonical_harness(harnesses.get(session_id))
+        local = facts.get(session_id)
+        if not isinstance(local, Mapping):
+            local = _note_facts(session, activity.get(session_id) or {}, harness)
+        cost = {
+            "reported_usd": _amount(session.get("cost_usd")),
+            "estimated_usd": _amount(allocated.get("estimated_cost_usd")),
+            "codex_credits": _amount(allocated.get("codex_credits")),
+            "codex_api_equivalent_usd": _amount(allocated.get("codex_api_equivalent_usd")),
+        }
+        model = session.get("model")
+        parent = session.get("parent_session_id")
+        started, ended = session.get("started_at"), session.get("ended_at")
+        record: dict[str, Any] = {
+            "id": session_id,
+            "actor_kind": session["actor_kind"],
+            "model": model if model != "unknown" and insight_label(model) else None,
+            "harness": harness if insight_label(harness) else None,
+            "effort": local.get("effort") or _effort(session.get("effort_level")),
+            "role": session.get("role"),
+            "parent_session_id": (
+                parent if insight_label(parent, MAX_INSIGHT_ID_CHARS) else None
+            ),
+            "started_at": started if isinstance(started, str) and INSIGHT_TIME.fullmatch(started) else None,
+            "ended_at": ended if isinstance(ended, str) and INSIGHT_TIME.fullmatch(ended) else None,
+            "cost": cost,
+            # An ancestor reported one cost for itself and this session, so a
+            # sum of the sessions must skip this session's own cost.
+            "cost_in_parent": bool(session.get("cost_covered_by_parent")),
+            "requests": _insight_count(allocated.get("request_count")),
+            **{field: local.get(field) for field in INSIGHT_FACT_FIELDS},
+            "committed_lines": committed.get(session_id, 0),
+            "head_lines": head.get(session_id, 0),
+        }
+        tokens = {
+            name: _insight_count(allocated.get(field))
+            for name, field in INSIGHT_TOKEN_FIELDS.items()
+        }
+        if any(value is not None for value in tokens.values()):
+            record["tokens"] = tokens
+        if local.get("by_model"):
+            record["by_model"] = local["by_model"]
+        dollars = insight_dollars(
+            cost["reported_usd"], cost["estimated_usd"], cost["codex_api_equivalent_usd"],
+        )
+        ranked.append((dollars, record, local.get("timeline")))
+    ranked.sort(key=lambda item: insight_order(item[0], item[1]["id"]))
+    kept = [record for _dollars, record, _timeline in ranked[:MAX_INSIGHT_SESSIONS]]
+    timelines = [
+        {"session_id": record["id"], "points": timeline["points"], "events": timeline["events"]}
+        for _dollars, record, timeline in ranked[:MAX_INSIGHT_SESSIONS]
+        if isinstance(timeline, Mapping)
+    ]
+    truncated = skipped or len(ranked) > MAX_INSIGHT_SESSIONS
+    size = _encoded_size({
+        "version": INSIGHTS_VERSION, "truncated": truncated,
+        "sessions": kept, "timelines": timelines,
+    })
+    # Both lists are in rank order, so the cheapest session's items go first.
+    for items in (timelines, kept):
+        while size > MAX_INSIGHT_BYTES and items:
+            size -= _encoded_size(items.pop()) + (1 if items else 0)
+            if not truncated:
+                truncated, size = True, size - 1
+    return {
+        "version": INSIGHTS_VERSION,
+        "truncated": truncated,
+        "sessions": sorted(kept, key=lambda record: (record["started_at"] or "", record["id"])),
+        "timelines": timelines,
+    }
+
+
 def build_pr_report(
     repo: str | Path, base_ref: str = "main", head_ref: str = "HEAD", *,
     notes: list[dict[str, Any]] | None = None,
     tasks: list[dict[str, Any]] | None = None,
     usage: Mapping[str, Mapping[str, Any]] | None = None,
+    session_facts: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Read only committed text and note evidence; never infer manual work from gaps.
 
@@ -328,6 +552,10 @@ def build_pr_report(
     It names no line and changes no cost total; it only labels a session whose
     harness never reported a model. A caller with no local spool passes none,
     and the footer renders exactly as it did.
+
+    ``session_facts`` holds how each session went, as rebuilt from a snapshot.
+    A caller that passes it, even empty, gets an ``insights`` object; no
+    footer row reads it.
     """
     root = Path(repo).resolve()
     base, head, merge_base, commits = _scope(root, base_ref, head_ref)
@@ -468,7 +696,9 @@ def build_pr_report(
 
     # The footer, the artifact, and the hosted page all read this one field,
     # so a known harness is named here, once, after every session of this PR is
-    # known and before any row, profile, or narrative label reads it.
+    # known and before any row, profile, or narrative label reads it. The
+    # insights keep the harness each session recorded.
+    recorded_harness = {session_id: session["harness"] for session_id, session in sessions.items()}
     for session in sessions.values():
         session["harness"] = _display_harness(session["harness"])
 
@@ -638,6 +868,9 @@ def build_pr_report(
     # A PR report reads committed evidence only, so the workflow profile comes
     # from the notes of this branch and never from a local ledger.
     note_activity, note_instruction_files = _note_workflow(loaded)
+    # The insights count each ledger session on its own, before the profile
+    # below joins the segments of one native conversation.
+    session_activity = dict(note_activity)
     # A subagent that owns no line of this PR is not a contributing session, so
     # no cost total charges it and no source row counts it. It still worked the
     # task, and the workflow object of each note names it, so the profile
@@ -791,6 +1024,21 @@ def build_pr_report(
         report["sessions_without_usage"] = without_usage
     if any(source.get("proxy_price") for source in agent_sources):
         report["proxy_price"] = True
+    if session_facts is not None:
+        # The lines the notes of this PR's own commits attribute to each
+        # session, before any later commit of the PR replaced some of them.
+        committed: Counter[str] = Counter()
+        for sha in commits:
+            for file in (by_commit.get(sha) or {}).get("files", ()):
+                for item in file["ranges"]:
+                    committed[item["session_id"]] += item["end"] - item["start"] + 1
+        members = (
+            (economic_participants | committed.keys()) & sessions.keys()
+        ) | owned_lines.keys()
+        report["insights"] = _insights(
+            members, sessions, usage or {}, session_facts, recorded_harness,
+            session_activity, committed, owned_lines,
+        )
     return report
 
 
