@@ -209,6 +209,14 @@ def _session_cost(session: Mapping[str, Any]) -> str:
     partial = telemetry.get("cost_complete") is False
     if reported is not None:
         return f"${reported:,.2f} reported"
+    if estimated is not None and credits is not None:
+        # A Codex subscription session prices a request with no credit price
+        # in dollars at the API rate, so it can hold both units.
+        result = (
+            f"${estimated:,.2f} estimated + "
+            + _credits(credits).replace(" cr", " Codex credits")
+        )
+        return f"{result} (partial)" if partial else result
     if estimated is not None:
         result = f"${estimated:,.2f} estimated"
         return f"{result} (partial)" if partial else result

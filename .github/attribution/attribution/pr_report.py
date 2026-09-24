@@ -525,31 +525,30 @@ def build_pr_report(
                     # A cost this run filled from telemetry is an estimate the
                     # provider priced, so it is summed apart from the cost a
                     # session reported and printed as the estimate it is.
-                    estimated = _amount(
-                        _allocated(session).get("estimated_cost_usd")
-                    )
+                    allocated = _allocated(session)
+                    estimated = _amount(allocated.get("estimated_cost_usd"))
+                    credits = _amount(allocated.get("codex_credits"))
                     if session["cost_usd"] is not None:
                         group["_costs"].append(session["cost_usd"])
-                    elif estimated is not None:
-                        group["_estimates"].append(estimated)
-                        if _allocated(session).get("cost_complete") is False:
-                            # The same rule the local report applies: an
-                            # estimate that priced only some of the requests
-                            # of a session is a partial cost, not a whole one.
-                            group["_partial_costs"] += 1
-                    elif _amount(_allocated(session).get("codex_credits")) is not None:
-                        # A Codex subscription session is priced in credits, so
-                        # it counts here in its own unit rather than reading as
-                        # an unknown dollar cost that marks the total partial.
-                        group["_credits"].append(
-                            _amount(_allocated(session).get("codex_credits"))
-                        )
-                        equivalent = _amount(
-                            _allocated(session).get("codex_api_equivalent_usd")
-                        )
-                        if equivalent is not None:
-                            group["_equivalents"].append(equivalent)
-                        if _allocated(session).get("cost_complete") is False:
+                    elif estimated is not None or credits is not None:
+                        # A Codex subscription session is priced in credits,
+                        # and a request with no credit price in dollars at
+                        # the API rate, so one session can hold both. Each
+                        # unit counts here on its own, and neither hides the
+                        # other.
+                        if estimated is not None:
+                            group["_estimates"].append(estimated)
+                        if credits is not None:
+                            group["_credits"].append(credits)
+                            equivalent = _amount(
+                                allocated.get("codex_api_equivalent_usd")
+                            )
+                            if equivalent is not None:
+                                group["_equivalents"].append(equivalent)
+                        if allocated.get("cost_complete") is False:
+                            # The same rule the local report applies: a cost
+                            # that priced only some of the requests of a
+                            # session is a partial cost, not a whole one.
                             group["_partial_costs"] += 1
                     else:
                         group["_unknown_costs"] += 1

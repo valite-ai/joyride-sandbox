@@ -9,6 +9,8 @@ import sqlite3
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
+from .pricing import price_event, price_openai_api
+
 
 _COMPLETED_CAPTURE_STATES = {
     "completed",
@@ -412,11 +414,34 @@ def allocate_session_usage(
         if harness is None or native is None:
             continue
         event_values = dict(raw_event)
+        is_request = raw_event.get("event_name") in {
+            "claude_code.api_request",
+            "codex.sse_event",
+            "codex.turn.token_usage",
+        }
+        unpriced_reason: str | None = None
+        if (
+            is_request
+            and _number(event_values.get("cost_usd")) is None
+            and _number(event_values.get("credits")) is None
+        ):
+            # A request stored without a price keeps its model and tokens, so
+            # the current prices fill it, including a request stored before
+            # its model had a price.
+            price = price_event(provider, event_values)
+            if price.amount is not None:
+                field = "credits" if price.unit == "credits" else "cost_usd"
+                event_values[field] = float(price.amount)
+                event_values["cost_source"] = price.source
+            else:
+                unpriced_reason = price.unpriced_reason or event_values.get(
+                    "unpriced_reason"
+                )
         if provider == "codex" and _number(event_values.get("credits")) is not None:
-            from .telemetry import compute_openai_api_usd
-
-            equivalent = compute_openai_api_usd(
-                str(event_values.get("model") or ""),
+            # Credits carry a comparison in dollars at the API rate for the
+            # same tokens, so a reader can weigh the two units.
+            equivalent = price_openai_api(
+                event_values.get("model"),
                 event_values.get("input_tokens"),
                 event_values.get("cached_input_tokens"),
                 event_values.get("output_tokens"),
@@ -424,7 +449,7 @@ def allocate_session_usage(
                     "cache_creation_input_tokens"
                 ),
                 service_tier=event_values.get("service_tier"),
-            )
+            ).amount
             if equivalent is not None:
                 event_values["codex_api_equivalent_usd"] = float(equivalent)
         if _number(event_values.get("total_tokens")) is None:
@@ -495,11 +520,6 @@ def allocate_session_usage(
             "output_tokens",
             "total_tokens",
         )
-        is_request = raw_event.get("event_name") in {
-            "claude_code.api_request",
-            "codex.sse_event",
-            "codex.turn.token_usage",
-        }
         request_has_cost = (
             _number(event_values.get("cost_usd")) is not None
             or _number(event_values.get("credits")) is not None
@@ -521,6 +541,7 @@ def allocate_session_usage(
                     "models": set(),
                     "model_output_tokens": {},
                     "sources": set(),
+                    "unpriced_reasons": Counter(),
                     "allocations": set(),
                     "has_usd": False,
                     "has_credits": False,
@@ -546,6 +567,8 @@ def allocate_session_usage(
                 usage["request_count"] += weight
                 if request_has_cost:
                     usage["priced_request_count"] += weight
+                elif isinstance(unpriced_reason, str) and unpriced_reason:
+                    usage["unpriced_reasons"][unpriced_reason] += weight
             model = raw_event.get("model")
             if isinstance(model, str) and model:
                 usage["models"].add(model)
@@ -555,7 +578,7 @@ def allocate_session_usage(
                 if output is not None:
                     outputs = usage["model_output_tokens"]
                     outputs[model] = outputs.get(model, 0.0) + output * weight
-            source = raw_event.get("cost_source")
+            source = event_values.get("cost_source")
             if isinstance(source, str) and source:
                 usage["sources"].add(source)
             usage["allocations"].add(allocation)
@@ -603,6 +626,10 @@ def allocate_session_usage(
             for model, counted in sorted(usage["model_output_tokens"].items())
         }
         usage["sources"] = sorted(usage["sources"])
+        usage["unpriced_reasons"] = {
+            reason: round(counted, 3)
+            for reason, counted in sorted(usage["unpriced_reasons"].items())
+        }
         allocations = usage.pop("allocations")
         usage["allocation"] = (
             next(iter(allocations)) if len(allocations) == 1 else "mixed"

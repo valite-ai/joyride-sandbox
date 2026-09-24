@@ -54,6 +54,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from .pricing import (
+    price_anthropic,
+    price_codex_credits,
+    price_codex_request,
+    price_openai_api,
+)
 from .runtime import current_runtime
 
 if TYPE_CHECKING:
@@ -68,58 +74,6 @@ _COLLECTOR_IDENTITY = "harness-attribution-telemetry-v1"
 _COLLECTOR_LOCK_FILENAME = "collector-startup.lock"
 _ORPHAN_CHECK_SECONDS = 1.0
 _MAX_IDENTITY_RESPONSE_BYTES = 4096
-CODEX_CHATGPT_CREDIT_RATES_EFFECTIVE_DATE = "2026-09-14"
-OPENAI_API_STANDARD_RATES_EFFECTIVE_DATE = "2026-09-14"
-CODEX_CHATGPT_CREDIT_RATES: dict[str, dict[str, Decimal]] = {
-    "gpt-6-astra": {
-        "input": Decimal("250"),
-        "cached_input": Decimal("25"),
-        "output": Decimal("1250"),
-    },
-    "gpt-5.6-sol": {
-        "input": Decimal("100"),
-        "cached_input": Decimal("10"),
-        "output": Decimal("500"),
-    },
-    "gpt-5.6-terra": {
-        "input": Decimal("50"),
-        "cached_input": Decimal("5"),
-        "output": Decimal("300"),
-    },
-    "gpt-5.6-luna": {
-        "input": Decimal("5"),
-        "cached_input": Decimal("0.5"),
-        "output": Decimal("30"),
-    },
-    "gpt-5.5": {
-        "input": Decimal("125"),
-        "cached_input": Decimal("12.5"),
-        "output": Decimal("750"),
-    },
-    "gpt-5.4": {
-        "input": Decimal("62.5"),
-        "cached_input": Decimal("6.25"),
-        "output": Decimal("375"),
-    },
-    "gpt-5.4-mini": {
-        "input": Decimal("18.75"),
-        "cached_input": Decimal("1.875"),
-        "output": Decimal("113"),
-    },
-}
-OPENAI_API_STANDARD_RATES: dict[str, dict[str, Decimal]] = {
-    "gpt-6-astra": {"input": Decimal("10"), "cached_input": Decimal("1"), "output": Decimal("50")},
-    # Read from the OpenAI API pricing page on 2026-09-23. No Codex credit
-    # rate was read for this model, so subscription turns stay unpriced.
-    "gpt-6-luna": {"input": Decimal("0.1"), "cached_input": Decimal("0.01"), "output": Decimal("0.5")},
-    "gpt-5.6-sol": {"input": Decimal("4"), "cached_input": Decimal("0.4"), "output": Decimal("20")},
-    "gpt-5.6-terra": {"input": Decimal("2"), "cached_input": Decimal("0.2"), "output": Decimal("12")},
-    "gpt-5.6-luna": {"input": Decimal("0.2"), "cached_input": Decimal("0.02"), "output": Decimal("1.2")},
-    "gpt-5.5": {"input": Decimal("5"), "cached_input": Decimal("0.5"), "output": Decimal("30")},
-    "gpt-5.4": {"input": Decimal("2.5"), "cached_input": Decimal("0.25"), "output": Decimal("15")},
-    "gpt-5.4-mini": {"input": Decimal("0.75"), "cached_input": Decimal("0.075"), "output": Decimal("4.5")},
-}
-
 # Retaining handles for children started by this process avoids premature
 # Popen finalization warnings and lets stop_collector reap them cleanly.  The
 # mapping has no external side effects and remains empty until startup.
@@ -159,6 +113,7 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
     cost_amount TEXT NULL,
     cost_unit TEXT NULL,
     cost_source TEXT NULL,
+    unpriced_reason TEXT NULL,
     query_source TEXT NULL,
     agent_id TEXT NULL,
     parent_agent_id TEXT NULL,
@@ -232,6 +187,7 @@ class _NormalizedEvent:
     cost_amount: str | None = None
     cost_unit: str | None = None
     cost_source: str | None = None
+    unpriced_reason: str | None = None
     query_source: str | None = None
     agent_id: str | None = None
     parent_agent_id: str | None = None
@@ -322,6 +278,10 @@ class TelemetryStore:
             if "service_tier" not in columns:
                 connection.execute(
                     "ALTER TABLE telemetry_events ADD COLUMN service_tier TEXT"
+                )
+            if "unpriced_reason" not in columns:
+                connection.execute(
+                    "ALTER TABLE telemetry_events ADD COLUMN unpriced_reason TEXT"
                 )
             for workflow_column in (
                 "query_source",
@@ -532,11 +492,11 @@ class TelemetryStore:
                         input_tokens,
                         cached_input_tokens, cache_creation_input_tokens,
                         output_tokens, total_tokens, cost_amount, cost_unit,
-                        cost_source, query_source, agent_id, parent_agent_id,
-                        agent_name, effort, observed_at_unix_nano
+                        cost_source, unpriced_reason, query_source, agent_id,
+                        parent_agent_id, agent_name, effort, observed_at_unix_nano
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -560,6 +520,7 @@ class TelemetryStore:
                         parsed.cost_amount,
                         parsed.cost_unit,
                         parsed.cost_source,
+                        parsed.unpriced_reason,
                         parsed.query_source,
                         parsed.agent_id,
                         parsed.parent_agent_id,
@@ -809,87 +770,22 @@ def compute_codex_chatgpt_credits(
     input_includes_cached: bool = True,
     service_tier: str | None = None,
 ) -> Decimal | None:
-    """Compute ChatGPT credits using the rate table effective 2026-09-14.
+    """Return the ChatGPT credits for one Codex request, or None.
 
     Official usage reports total input including cached input, so that is the
     default.  Set ``input_includes_cached=False`` only for a source that reports
-    uncached input separately.
+    uncached input separately.  ``attribution.pricing`` holds the rates.
     """
 
-    model_name = str(model)
-    rates = CODEX_CHATGPT_CREDIT_RATES.get(model_name)
-    if rates is None:
-        return None
-    if input_tokens is None or output_tokens is None:
-        return None
-    multiplier = _chatgpt_service_tier_multiplier(model_name, service_tier)
-    if multiplier is None:
-        return None
-    input_count = max(input_tokens or 0, 0)
-    if input_count > 272_000:
-        # Long-context and service-tier multipliers are model-specific. OTel
-        # does not currently guarantee enough pricing metadata to infer them.
-        return None
-    cached_count = max(cached_input_tokens or 0, 0)
-    cache_write_count = max(cache_write_input_tokens or 0, 0)
-    output_count = max(output_tokens or 0, 0)
-    if input_includes_cached:
-        cached_count = min(cached_count, input_count)
-        cache_write_count = min(cache_write_count, input_count - cached_count)
-        # Codex credit pricing does not charge for prompt-cache writes.
-        uncached_count = input_count - cached_count - cache_write_count
-    else:
-        uncached_count = input_count
-    credits = (
-        Decimal(uncached_count) * rates["input"]
-        + Decimal(cached_count) * rates["cached_input"]
-        + Decimal(output_count) * rates["output"]
-    ) / Decimal(1_000_000)
-    return credits * multiplier
-
-
-def _chatgpt_service_tier_multiplier(
-    model: str, service_tier: str | None
-) -> Decimal | None:
-    tier = (service_tier or "default").strip().casefold()
-    if tier in {"", "default", "standard", "auto"}:
-        return Decimal("1")
-    if tier not in {"fast", "priority"}:
-        return None
-    if model in {"gpt-5.4", "gpt-5.4-mini"}:
-        return Decimal("2")
-    if model in {
-        "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-    }:
-        return Decimal("2.5")
-    return None
-
-
-def _api_service_tier_multiplier(
-    model: str, service_tier: str | None
-) -> Decimal | None:
-    tier = (service_tier or "default").strip().casefold()
-    if tier in {"", "default", "standard", "auto"}:
-        return Decimal("1")
-    if tier not in {"fast", "priority"}:
-        return None
-    if model == "gpt-5.5":
-        return Decimal("2.5")
-    if model in {
-        "gpt-6-astra",
-        "gpt-6-luna",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-    }:
-        return Decimal("2")
-    return None
+    return price_codex_credits(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        cache_write_input_tokens=cache_write_input_tokens,
+        service_tier=service_tier,
+        input_includes_cached=input_includes_cached,
+    ).amount
 
 
 def compute_openai_api_usd(
@@ -901,46 +797,16 @@ def compute_openai_api_usd(
     cache_write_input_tokens: int | None = None,
     service_tier: str | None = None,
 ) -> Decimal | None:
-    """Estimate standard-tier API cost; fail closed for long-context pricing."""
+    """Return the OpenAI API price in dollars for one request, or None."""
 
-    rates = OPENAI_API_STANDARD_RATES.get(str(model))
-    if rates is None:
-        return None
-    if input_tokens is None or output_tokens is None:
-        return None
-    model_name = str(model)
-    multiplier = _api_service_tier_multiplier(model_name, service_tier)
-    if multiplier is None:
-        return None
-    input_count = max(input_tokens or 0, 0)
-    if input_count > 272_000:
-        # Long-context and service-tier multipliers are model-specific. OTel
-        # does not currently guarantee enough pricing metadata to infer them.
-        return None
-    cached_count = min(max(cached_input_tokens or 0, 0), input_count)
-    cache_write_count = min(
-        max(cache_write_input_tokens or 0, 0), input_count - cached_count
-    )
-    uncached_count = input_count - cached_count - cache_write_count
-    output_count = max(output_tokens or 0, 0)
-    cache_write_multiplier = (
-        Decimal("1.25")
-        if model_name
-        in {
-            "gpt-6-astra",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-        }
-        else Decimal("1")
-    )
-    return multiplier * (
-        Decimal(uncached_count) * rates["input"]
-        + Decimal(cached_count) * rates["cached_input"]
-        + Decimal(cache_write_count) * rates["input"] * cache_write_multiplier
-        + Decimal(output_count) * rates["output"]
-    ) / Decimal(1_000_000)
+    return price_openai_api(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        cache_write_input_tokens=cache_write_input_tokens,
+        service_tier=service_tier,
+    ).amount
 
 
 def _event_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -1281,6 +1147,7 @@ def _parse_claude_record(
     client_request = _bounded_text(_get(attributes, "client_request"))
     tool_use = _bounded_text(_get(attributes, "tool_use"))
     model = _bounded_text(_get(attributes, "model"), 256)
+    service_tier = _bounded_text(_get(attributes, "service_tier"), 64)
     observed = _observed_time(record)
     input_tokens = _nonnegative_int(_get(attributes, "input_tokens"))
     cached_tokens = _nonnegative_int(_get(attributes, "cached_input_tokens"))
@@ -1301,6 +1168,11 @@ def _parse_claude_record(
             total_tokens = _sqlite_safe_sum(*parts)
 
     amount: Decimal | None = None
+    # Only the price Claude Code sent identifies a record. A price Joyride
+    # infers can change between runs, so it never enters the event key.
+    reported_amount: Decimal | None = None
+    cost_source: str | None = None
+    unpriced_reason: str | None = None
     if event_name == "claude_code.api_request":
         micros = _nonnegative_int(_get(attributes, "cost_usd_micros"))
         amount = (
@@ -1310,6 +1182,22 @@ def _parse_claude_record(
         )
         if amount is not None and amount > Decimal("1000000000"):
             amount = None
+        if amount is not None:
+            reported_amount = amount
+            cost_source = "vendor_estimate"
+        else:
+            # Claude Code prices each request itself. When it sent no price,
+            # the Anthropic list price of the counted tokens stands in.
+            price = price_anthropic(
+                model,
+                input_tokens,
+                cached_tokens,
+                cache_creation,
+                output_tokens,
+                service_tier=service_tier,
+            )
+            amount, cost_source = price.amount, price.source
+            unpriced_reason = price.unpriced_reason
     elif prompt is None or tool_use is None:
         return None
 
@@ -1330,7 +1218,7 @@ def _parse_claude_record(
             cached_tokens,
             cache_creation,
             output_tokens,
-            _decimal_text(amount),
+            _decimal_text(reported_amount),
             observed,
         )
     )
@@ -1345,6 +1233,7 @@ def _parse_claude_record(
         request_id=request,
         client_request_id=client_request,
         model=model,
+        service_tier=service_tier,
         input_tokens=input_tokens,
         cached_input_tokens=cached_tokens,
         cache_creation_input_tokens=cache_creation,
@@ -1352,7 +1241,8 @@ def _parse_claude_record(
         total_tokens=total_tokens,
         cost_amount=_decimal_text(amount),
         cost_unit="USD" if amount is not None else None,
-        cost_source="vendor_estimate" if amount is not None else None,
+        cost_source=cost_source if amount is not None else None,
+        unpriced_reason=unpriced_reason,
         **_workflow_labels(attributes),
         observed_at_unix_nano=observed,
         tool_use_id=tool_use,
@@ -1395,27 +1285,15 @@ def _parse_codex_record(
         total_tokens = _sqlite_safe_sum(input_tokens, output_tokens)
     observed = _observed_time(record)
 
-    credits: Decimal | None = None
-    api_cost: Decimal | None = None
-    normalized_auth = auth_mode.casefold() if auth_mode else ""
-    if normalized_auth in {"chatgpt", "swic"} and model is not None:
-        credits = compute_codex_chatgpt_credits(
-            model,
-            input_tokens,
-            cached_tokens,
-            output_tokens,
-            cache_write_input_tokens=cache_write_tokens,
-            service_tier=service_tier,
-        )
-    elif normalized_auth in {"api", "api_key", "apikey"} and model is not None:
-        api_cost = compute_openai_api_usd(
-            model,
-            input_tokens,
-            cached_tokens,
-            output_tokens,
-            cache_write_input_tokens=cache_write_tokens,
-            service_tier=service_tier,
-        )
+    price = price_codex_request(
+        model,
+        auth_mode,
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        cache_write_input_tokens=cache_write_tokens,
+        service_tier=service_tier,
+    )
 
     identity = (
         ("request", request)
@@ -1450,17 +1328,10 @@ def _parse_codex_record(
         cache_creation_input_tokens=cache_write_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
-        cost_amount=_decimal_text(credits if credits is not None else api_cost),
-        cost_unit=(
-            "credits" if credits is not None else "USD" if api_cost is not None else None
-        ),
-        cost_source=(
-            f"chatgpt_credit_rate_{CODEX_CHATGPT_CREDIT_RATES_EFFECTIVE_DATE}"
-            if credits is not None
-            else f"openai_api_standard_rate_{OPENAI_API_STANDARD_RATES_EFFECTIVE_DATE}"
-            if api_cost is not None
-            else None
-        ),
+        cost_amount=_decimal_text(price.amount),
+        cost_unit=price.unit if price.amount is not None else None,
+        cost_source=price.source if price.amount is not None else None,
+        unpriced_reason=price.unpriced_reason,
         **_workflow_labels(attributes),
         observed_at_unix_nano=observed,
     )
