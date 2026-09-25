@@ -905,8 +905,14 @@ def record_commit(repo: RepoPath, commit: str = "HEAD") -> dict[str, object]:
         return _record_commit_locked(root, commit_sha)
 
 
-def _record_commit_locked(root: Path, commit_sha: str) -> dict[str, object]:
-    """Record a resolved commit while the caller holds the worktree lock."""
+def _record_commit_locked(
+    root: Path, commit_sha: str, *, settled: bool = False
+) -> dict[str, object]:
+    """Record a resolved commit while the caller holds the worktree lock.
+
+    ``settled`` means the caller already recorded what every open native
+    capture changed before this commit, so those captures need not finish.
+    """
 
     connection = open_db(root)
     try:
@@ -923,7 +929,7 @@ def _record_commit_locked(root: Path, commit_sha: str) -> dict[str, object]:
             """,
             (worktree_id, worktree_id),
         ).fetchone()
-        if active_hook is not None:
+        if active_hook is not None and not settled:
             raise ValueError(
                 "Joyride did not record the commit because a native hook "
                 "capture is active. Finish the capture or run `joyride recover`."

@@ -1108,14 +1108,127 @@ def _before_rows(
     }
 
 
-def _drain_pending(repo: Path, worktree_id: str) -> tuple[list[str], list[str]]:
+def _settle_open_captures(connection: sqlite3.Connection, repo: Path, worktree_id: str) -> None:
+    """Record what each open capture changed so far, and restart its baseline.
+
+    A commit inside a tool call must not wait for that call to finish: the
+    push that follows in the same call needs the note. Each open capture's
+    files are compared with the tree as it is now, the changes are recorded
+    under the same ownership rule as at completion, and a fresh baseline
+    makes the completion record only what changes after the commit.
+    """
+
+    captures = connection.execute(
+        "SELECT * FROM hook_captures WHERE worktree_id = ? AND status = 'pending' AND snapshot_state IS NOT NULL",
+        (worktree_id,),
+    ).fetchall()
+    for capture in captures:
+        before_rows = _before_rows(connection, capture["id"])
+        before_contents = {
+            path: bytes(row["before_content"]) if row["before_content"] is not None else None
+            for path, row in before_rows.items()
+            if row["skip_reason"] is None
+        }
+        skipped = {
+            path: row["skip_reason"] for path, row in before_rows.items() if row["skip_reason"] is not None
+        }
+        if capture["snapshot_scope"] == "targeted":
+            paths = json.loads(capture["snapshot_state"])["paths"]
+            targeted = _targeted_snapshot(repo, paths)
+            if targeted is None:
+                continue
+            after, after_skips = targeted
+            state, fresh, fresh_skipped = None, after, after_skips
+        else:
+            before_contents, changed_skips, after, after_skips = _metadata_changes(
+                repo,
+                json.loads(zlib.decompress(capture["snapshot_state"])),
+                before_contents,
+                capture["base_commit"],
+                max_files=MAX_NATIVE_SNAPSHOT_FILES,
+                max_total_bytes=MAX_NATIVE_SNAPSHOT_BYTES,
+            )
+            skipped.update(changed_skips)
+            state, fresh, fresh_skipped = _metadata_snapshot(
+                repo, max_files=MAX_NATIVE_SNAPSHOT_FILES, max_total_bytes=MAX_NATIVE_SNAPSHOT_BYTES
+            )
+        if any(reason.startswith("snapshot_") for reason in (*after_skips.values(), *fresh_skipped.values())):
+            # Over the limit, the capture keeps its deltas unknown as before.
+            continue
+        peers = _peer_captures(connection, capture["overlap_peers"])
+        ignored_directories = [
+            path for skips in (skipped, after_skips) for path, reason in skips.items()
+            if reason == "ignored_preexisting_directory"
+        ]
+        for path in sorted(set(before_contents) | set(after)):
+            if (
+                path in skipped
+                or path in after_skips
+                or any(path.startswith(directory) for directory in ignored_directories)
+            ):
+                continue
+            before_content = before_contents.get(path)
+            after_content = after.get(path)
+            if before_content == after_content:
+                continue
+            if peers:
+                skip, before_content = _shared_path(
+                    connection, capture, peers, path, before_content, after_content
+                )
+                if skip or before_content == after_content:
+                    continue
+            connection.execute(
+                """
+                INSERT INTO edits(
+                    session_id, path, before_content, after_content,
+                    before_hash, after_hash, base_commit, tool_use_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    capture["ledger_session_id"], path, before_content, after_content,
+                    _content_hash(before_content), _content_hash(after_content),
+                    capture["base_commit"], capture["tool_use_id"],
+                ),
+            )
+        # The note reads only sessions with an end time; the completion moves it later.
+        connection.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+            (_utc_now(), capture["ledger_session_id"]),
+        )
+        # Later changes belong to the next commit, so the capture continues
+        # from the head that now exists, and clean files are read from it.
+        connection.execute(
+            "UPDATE hook_captures SET base_commit = ? WHERE id = ?",
+            (_base_commit(repo), capture["id"]),
+        )
+        if state is not None:
+            connection.execute(
+                "UPDATE hook_captures SET snapshot_state = ? WHERE id = ?",
+                (zlib.compress(json.dumps(state, separators=(",", ":")).encode(), 1), capture["id"]),
+            )
+        connection.execute("DELETE FROM hook_capture_files WHERE capture_id = ?", (capture["id"],))
+        for path in sorted(set(fresh) | set(fresh_skipped)):
+            content = fresh.get(path)
+            connection.execute(
+                """
+                INSERT INTO hook_capture_files(
+                    capture_id, path, before_content, before_hash, skip_reason
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (capture["id"], path, content, _content_hash(content), fresh_skipped.get(path)),
+            )
+
+
+def _drain_pending(
+    repo: Path, worktree_id: str, *, settled: bool = False
+) -> tuple[list[str], list[str]]:
     recorded: list[str] = []
     warnings: list[str] = []
     while True:
         with _worktree_lock(repo, blocking=True):
             connection = open_db(repo)
             try:
-                if _active_count(connection, worktree_id):
+                if not settled and _active_count(connection, worktree_id):
                     return recorded, warnings
                 queued = connection.execute(
                     """
@@ -1137,7 +1250,7 @@ def _drain_pending(repo: Path, worktree_id: str) -> tuple[list[str], list[str]]:
                 # Keep the worktree serialized from the settled-capture check
                 # through immutable note publication. A new Pre hook cannot
                 # otherwise appear between those two decisions.
-                _record_commit_locked(repo, commit_sha)
+                _record_commit_locked(repo, commit_sha, settled=settled)
             except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
                 warnings.append(
                     f"Deferred commit {commit_sha[:12]} was not recorded: {_warning(exc)}"
@@ -2275,13 +2388,33 @@ def handle_git_hook(repo: RepoPath, event: str = "post-commit") -> dict[str, obj
                         (worktree_id,),
                     ).rowcount
                 connection.commit()
+                settled = False
                 if _active_count(connection, worktree_id):
-                    outcome = _result("pending")
-                    outcome["summary"] = [_pending_summary(commit_sha, imported)]
-                    return outcome
+                    placeholders = ",".join("?" for _ in ACTIVE_CAPTURE_STATES)
+                    unsettled = connection.execute(
+                        f"""
+                        SELECT 1 FROM hook_units WHERE worktree_id = ? AND active = 1
+                        UNION ALL
+                        SELECT 1 FROM hook_captures
+                        WHERE worktree_id = ? AND harness = 'manual' AND status IN ({placeholders})
+                        LIMIT 1
+                        """,
+                        (worktree_id, worktree_id, *ACTIVE_CAPTURE_STATES),
+                    ).fetchone()
+                    if unsettled is not None:
+                        # A public lifecycle unit has no snapshot to settle,
+                        # and a wrapper run keeps its baseline in memory.
+                        outcome = _result("pending")
+                        outcome["summary"] = [_pending_summary(commit_sha, imported)]
+                        return outcome
+                    # A commit inside a tool call gets its note now, so a
+                    # push in the same call can share it.
+                    _settle_open_captures(connection, root, worktree_id)
+                    connection.commit()
+                    settled = True
             finally:
                 connection.close()
-        recorded, warnings = _drain_pending(root, worktree_id)
+        recorded, warnings = _drain_pending(root, worktree_id, settled=settled)
         status = "captured" if recorded else ("warning" if warnings else "ignored")
         outcome = _result(status, recorded_commits=recorded, warnings=warnings)
         if commit_sha in recorded:
