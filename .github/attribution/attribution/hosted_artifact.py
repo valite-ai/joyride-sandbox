@@ -938,7 +938,8 @@ def validate_artifact(value: Any, *, require_digest: bool = True) -> dict[str, A
         if not isinstance(record["model"], str) or not record["model"] or not isinstance(record["harness"], str):
             raise ValueError("Artifact summary source label is invalid.")
         _nonnegative_int(record["lines"], "summary source lines")
-        _nonnegative_int(record["session_count"], "summary source session count")
+        # A model that served part of a session counts as that part.
+        _nonnegative_number(record["session_count"], "summary source session count")
         _nonnegative_number(record["reported_cost_usd"], "summary source cost", optional=True)
         _nonnegative_number(
             record.get("estimated_cost_usd"), "summary source estimated cost",

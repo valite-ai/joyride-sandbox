@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .cost_reasons import add_reasons, describe, is_proxy_priced, limit_reasons
 from .costing import _effort, allocate_session_usage
@@ -350,6 +350,60 @@ def _allocated(session: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return the telemetry a local run allocated to one session, or nothing."""
     value = session.get("telemetry")
     return value if isinstance(value, Mapping) else {}
+
+
+def _whole(value: float) -> int | float:
+    """Round a session share to two places, as a plain integer when it is one."""
+    rounded = round(value, 2)
+    return int(rounded) if rounded == int(rounded) else rounded
+
+
+def _model_shares(
+    sessions: Mapping[str, Mapping[str, Any]], participants: Iterable[str]
+) -> dict[str, float]:
+    """Return each session's share of the root session it belongs to.
+
+    A session, its subagents, and its segments after a model switch make one
+    root session, which counts once. Each member's share is its part of the
+    root's tokens, or of its requests when no tokens are known, or an equal
+    part when neither is known, so a model that served part of a session
+    counts as that part rather than as a whole session.
+    """
+
+    def root(session_id: str) -> str:
+        seen: set[str] = set()
+        while session_id not in seen:
+            seen.add(session_id)
+            parent = sessions[session_id].get("parent_session_id")
+            if not isinstance(parent, str) or parent not in sessions:
+                break
+            session_id = parent
+        return sessions[session_id].get("source_session_id") or session_id
+
+    members: dict[str, list[str]] = {}
+    for session_id in participants:
+        members.setdefault(root(session_id), []).append(session_id)
+    shares: dict[str, float] = {}
+    for group in members.values():
+        tokens = {
+            session_id: float(sessions[session_id].get("token_count") or 0)
+            for session_id in group
+        }
+        for session_id in group:
+            # A parent that reported its children's tokens inside its own
+            # count keeps only its own part.
+            parent = sessions[session_id].get("parent_session_id")
+            if sessions[session_id].get("tokens_covered_by_parent") and parent in tokens:
+                tokens[parent] = max(0.0, tokens[parent] - tokens[session_id])
+        weights = tokens if any(tokens.values()) else {
+            session_id: float(_allocated(sessions[session_id]).get("request_count") or 0)
+            for session_id in group
+        }
+        if not any(weights.values()):
+            weights = dict.fromkeys(group, 1.0)
+        total = sum(weights.values())
+        shares.update({session_id: weight / total for session_id, weight in weights.items()})
+    return shares
 
 
 def _usage_tokens(usage: Mapping[str, Any]) -> int | None:
@@ -736,6 +790,7 @@ def build_pr_report(
         if sessions[session_id]["actor_kind"] == "ai"
     ]
     economics = _task_economics(ai_sessions)
+    shares = _model_shares(sessions, economic_participants & sessions.keys())
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for session_id in sorted((economic_participants & sessions.keys()) | owned_lines.keys()):
         session = sessions[session_id]
@@ -743,7 +798,7 @@ def build_pr_report(
                (session["actor_kind"], session["model"], session["harness"]))
         group = grouped.setdefault(key, {
             "actor_kind": key[0], "model": key[1], "harness": key[2], "lines": 0,
-            "session_count": 0, "_sessions": set(), "_costs": [], "_tokens": [],
+            "session_count": 0, "_share": 0.0, "_costs": [], "_tokens": [],
             "_estimates": [], "_credits": [], "_equivalents": [],
             "_partial_costs": 0, "_unknown_costs": 0,
             "_unknown_tokens": 0, "_covered_costs": 0, "_covered_tokens": 0,
@@ -751,7 +806,7 @@ def build_pr_report(
         })
         group["lines"] += owned_lines[session_id]
         if session_id in economic_participants:
-            group["_sessions"].add(session.get("source_session_id") or session_id)
+            group["_share"] += shares[session_id]
             if session["actor_kind"] == "ai":
                 # The whole usage record, which a session keeps even when none
                 # of its requests had a price and so no telemetry is attached.
@@ -817,7 +872,7 @@ def build_pr_report(
                     group["_unknown_tokens"] += 1
     sources = []
     for key, group in sorted(grouped.items()):
-        group["session_count"] = len(group.pop("_sessions"))
+        group["session_count"] = _whole(group.pop("_share"))
         costs = group.pop("_costs")
         estimates = group.pop("_estimates")
         credits = group.pop("_credits")
@@ -1279,7 +1334,7 @@ def _source_label(source: dict[str, Any]) -> str:
     return " · ".join(named) or "Unknown agent"
 
 
-def _sessions_cell(count: int) -> str:
+def _sessions_cell(count: float) -> str:
     """Show how many sessions one row counted, or a dash for none.
 
     A harness that reported two models inside one session leaves a row with no
@@ -1377,7 +1432,7 @@ def render_footer(report: dict[str, Any], *, details_url: str | None = None) -> 
             source["session_count"] for source in agents if source["session_count"] > 0
         )
         rows.extend([
-            f"| Total | {_sessions_cell(counted)} | {_cost_cell(report)} |", "",
+            f"| Total | {_sessions_cell(_whole(counted))} | {_cost_cell(report)} |", "",
         ])
         unknown = describe(
             report.get("unpriced_reasons"),
