@@ -240,7 +240,7 @@ def _identity(pr: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _details_url(base_url: str | None, pr: dict[str, Any]) -> str | None:
-    """Build one immutable UI route from trusted configuration and PR identity."""
+    """Build the current-report route from trusted configuration and PR identity."""
     if base_url is None or not base_url.strip():
         return None
     value = base_url.strip().rstrip("/")
@@ -270,9 +270,9 @@ def _details_url(base_url: str | None, pr: dict[str, Any]) -> str | None:
         raise ValueError(
             "ATTRIBUTION_UI_URL must be an HTTPS base URL, or an explicit loopback HTTP URL."
         )
-    number, repository, base, head = _identity(pr)[0], _repository_name(
+    number, repository = _identity(pr)[0], _repository_name(
         pr["base"]["repo"]["full_name"]
-    ), pr["base"]["sha"], pr["head"]["sha"]
+    )
     owner, name = repository.split("/", 1)
     if (
         number > 999_999_999
@@ -286,7 +286,7 @@ def _details_url(base_url: str | None, pr: dict[str, Any]) -> str | None:
         )
     route = "/".join(
         quote(str(component), safe="")
-        for component in (owner, name, number, base, head)
+        for component in (owner, name, number)
     )
     return f"{value}/pr/{route}"
 
