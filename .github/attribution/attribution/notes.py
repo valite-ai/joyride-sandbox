@@ -224,6 +224,29 @@ def _eligible_edits(
         """,
         parameters,
     ).fetchall()
+    return _edits_from_rows(rows)
+
+
+def _transplant_edits(connection: sqlite3.Connection, path: str) -> list[_Edit]:
+    """Return every scoped edit of ``path`` in the repository, whatever its worktree or base."""
+
+    rows = connection.execute(
+        """
+        SELECT e.id, e.session_id, e.before_content, e.after_content, e.tool_use_id
+        FROM edits AS e
+        JOIN sessions AS s ON s.id = e.session_id
+        WHERE e.path = ?
+          AND s.worktree_id IS NOT NULL
+          AND COALESCE(e.base_commit, s.base_commit) IS NOT NULL
+          AND s.ended_at IS NOT NULL
+        ORDER BY e.id
+        """,
+        (path,),
+    ).fetchall()
+    return _edits_from_rows(rows)
+
+
+def _edits_from_rows(rows: list[sqlite3.Row]) -> list[_Edit]:
     return [
         _Edit(
             edit_id=row["id"],
@@ -262,6 +285,74 @@ def _exact_chain(edits: list[_Edit], target: bytes | None) -> list[_Edit]:
         used.add(predecessor.edit_id)
         cursor = predecessor
     return list(reversed(reverse_chain))
+
+
+def _line_change(old: bytes | None, new: bytes | None) -> tuple[list[int], list[int]]:
+    """Return the removed old-line indices and the added new-line indices, in order."""
+
+    removed: list[int] = []
+    added: list[int] = []
+    for operation, old_start, old_end, new_start, new_end in _changed_line_opcodes(old, new):
+        if operation in {"delete", "replace"}:
+            removed.extend(range(old_start, old_end))
+        if operation in {"insert", "replace"}:
+            added.extend(range(new_start, new_end))
+    return removed, added
+
+
+def _transplanted_chain(
+    edits: list[_Edit], old: bytes | None, new: bytes | None
+) -> tuple[list[_Edit], _Reconciled] | None:
+    """Find the latest chain, from any worktree or base, whose whole change this commit repeats.
+
+    A patch moved to another worktree with ``git apply``, or a branch rebuilt on
+    a newer base, commits lines that no edit in the commit's own worktree
+    produced. The change still belongs to the session that made it when the
+    commit removes exactly the lines the chain removed and adds exactly the
+    lines the chain added, in the same order. A partial or different change
+    never matches, so an unrelated commit cannot borrow a session.
+    """
+
+    old_lines, new_lines = _lines(old), _lines(new)
+    removed, added = _line_change(old, new)
+    if not removed and not added:
+        return None
+    target_removed = [old_lines[index] for index in removed]
+    target_added = [new_lines[index] for index in added]
+    seen: set[bytes | None] = set()
+    for candidate in reversed(edits):
+        if candidate.after in seen:
+            continue
+        seen.add(candidate.after)
+        # Every added line must exist in the candidate's result before the
+        # diffs below are worth their cost.
+        if not set(target_added) <= set(_lines(candidate.after)):
+            continue
+        chain = _exact_chain(edits, candidate.after)
+        first, last = chain[0].before, chain[-1].after
+        first_lines, last_lines = _lines(first), _lines(last)
+        chain_removed, chain_added = _line_change(first, last)
+        if (
+            [first_lines[index] for index in chain_removed] != target_removed
+            or [last_lines[index] for index in chain_added] != target_added
+        ):
+            continue
+        foreign = _reconcile(first, last, chain)
+        owners: list[str | None] = [None] * len(new_lines)
+        tool_use_ids: list[str | None] = [None] * len(new_lines)
+        for index, source in zip(added, chain_added):
+            owners[index] = foreign.owners[source]
+            tool_use_ids[index] = foreign.tool_use_ids[source]
+        removal_owners: dict[int, str] = {}
+        for index, source in zip(removed, chain_removed):
+            owner = foreign.removal_owners.get(source)
+            if owner is not None:
+                removal_owners[index] = owner
+        return chain, _Reconciled(
+            owners=owners, tool_use_ids=tool_use_ids, removal_owners=removal_owners,
+            session_revisions=foreign.session_revisions,
+        )
+    return None
 
 
 def _initial_origins(parent: bytes | None, observed: bytes | None) -> list[int | None]:
@@ -1017,8 +1108,14 @@ def _record_commit_locked(
                 continue
             edits = _eligible_edits(connection, ledger_path, parent, worktree_id)
             chain = _exact_chain(edits, new_content)
+            if chain:
+                reconciled = _reconcile(old_content, new_content, chain)
+            else:
+                transplanted = _transplanted_chain(
+                    _transplant_edits(connection, ledger_path), old_content, new_content
+                )
+                chain, reconciled = transplanted or ([], _reconcile(old_content, new_content, []))
             matched_session_ids.update(edit.session_id for edit in chain)
-            reconciled = _reconcile(old_content, new_content, chain)
             session_revisions.extend(
                 {"path": ledger_path, **revision} for revision in reconciled.session_revisions
             )
