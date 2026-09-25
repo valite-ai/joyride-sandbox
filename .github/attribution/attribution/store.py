@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS hook_captures (
     status TEXT NOT NULL,
     snapshot_scope TEXT NULL,
     snapshot_state BLOB NULL,
+    overlap_peers TEXT NULL,
     UNIQUE (worktree_id, harness, native_session_id, tool_use_id),
     FOREIGN KEY (ledger_session_id) REFERENCES sessions(id)
 );
@@ -582,6 +583,7 @@ def open_db(repo: RepoPath) -> sqlite3.Connection:
             for name, declaration in (
                 ("snapshot_scope", "TEXT"),
                 ("snapshot_state", "BLOB"),
+                ("overlap_peers", "TEXT"),
             ):
                 if name not in capture_columns:
                     connection.execute(

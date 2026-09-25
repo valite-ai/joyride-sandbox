@@ -1553,13 +1553,18 @@ def run_session(
                 connection = open_db(root)
                 try:
                     capture = connection.execute(
-                        "SELECT status FROM hook_captures WHERE id = ?",
+                        "SELECT * FROM hook_captures WHERE id = ?",
                         (capture_id,),
                     ).fetchone()
                     if capture is None:
                         raise ValueError("Manual attribution capture state disappeared")
                     capture_status = str(capture["status"])
                     if capture_status == "pending":
+                        from .automation import _peer_captures, _shared_path
+
+                        # A native tool that began inside this interval owns
+                        # the files it recorded or named, as in the hooks.
+                        peers = _peer_captures(connection, capture["overlap_peers"])
                         after, after_skips = _snapshot(root, include_ignored=True)
                         blocked_paths = set(before_skips) | set(after_skips)
                         ignored_directories = {
@@ -1578,6 +1583,12 @@ def run_session(
                             after_content = after.get(path)
                             if before_content == after_content:
                                 continue
+                            if peers:
+                                skip, before_content = _shared_path(
+                                    connection, capture, peers, path, before_content, after_content
+                                )
+                                if skip or before_content == after_content:
+                                    continue
                             changed_files.append(path)
                             connection.execute(
                                 """

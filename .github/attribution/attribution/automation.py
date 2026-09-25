@@ -804,6 +804,92 @@ def _active_count(connection: sqlite3.Connection, worktree_id: str) -> int:
     return count
 
 
+def _peer_ids(value: object) -> list[str]:
+    """Return the capture ids one ``overlap_peers`` column holds."""
+
+    if not isinstance(value, str):
+        return []
+    try:
+        peers = json.loads(value)
+    except ValueError:
+        return []
+    return [peer for peer in peers if isinstance(peer, str)] if isinstance(peers, list) else []
+
+
+def _peer_captures(connection: sqlite3.Connection, value: object) -> list[sqlite3.Row]:
+    rows = [
+        connection.execute("SELECT * FROM hook_captures WHERE id = ?", (peer_id,)).fetchone()
+        for peer_id in _peer_ids(value)
+    ]
+    return [row for row in rows if row is not None]
+
+
+def _capture_targets(capture: sqlite3.Row) -> set[str] | None:
+    """Return the files a capture's tool named, or None when it could change any file."""
+
+    if capture["snapshot_scope"] != "targeted" or capture["snapshot_state"] is None:
+        return None
+    return set(json.loads(capture["snapshot_state"])["paths"])
+
+
+def _shared_path(
+    connection: sqlite3.Connection,
+    capture: sqlite3.Row,
+    peers: list[sqlite3.Row],
+    path: str,
+    before_content: bytes | None,
+    after_content: bytes | None,
+) -> tuple[bool, bytes | None]:
+    """Decide who owns one changed file of a capture that overlapped others.
+
+    Returns ``(skip, before)``. A peer that already recorded an edit of the
+    file owns that change, so this capture keeps only what changed after it.
+    A peer that is still running, named the file, and has not yet seen its
+    final content records it when that peer completes. Every other change
+    belongs to this capture, so no file is left without an owner.
+    """
+
+    latest = max(
+        (
+            row
+            for peer in peers
+            # A wrapper interval records its edits without a tool id.
+            for row in connection.execute(
+                "SELECT id, after_content, after_hash FROM edits WHERE session_id = ? AND (tool_use_id = ? OR tool_use_id IS NULL) AND path = ?",
+                (peer["ledger_session_id"], peer["tool_use_id"], path),
+            )
+        ),
+        key=lambda row: int(row["id"]),
+        default=None,
+    )
+    if latest is not None:
+        if latest["after_hash"] == _content_hash(after_content):
+            return True, None
+        return False, (
+            bytes(latest["after_content"]) if latest["after_content"] is not None else None
+        )
+    targets = _capture_targets(capture)
+    if targets is not None and path in targets:
+        return False, before_content
+    for peer in peers:
+        peer_targets = _capture_targets(peer)
+        if (
+            peer["status"] not in ACTIVE_CAPTURE_STATES
+            or peer_targets is None
+            or path not in peer_targets
+        ):
+            continue
+        row = connection.execute(
+            "SELECT before_hash FROM hook_capture_files WHERE capture_id = ? AND path = ?",
+            (peer["id"], path),
+        ).fetchone()
+        # A named file without a baseline row did not exist when the peer began.
+        peer_before = row["before_hash"] if row is not None else _content_hash(None)
+        if peer_before != _content_hash(after_content):
+            return True, None
+    return False, before_content
+
+
 def _handle_fast_pre(
     repo: Path,
     payload: Mapping[str, Any],
@@ -917,13 +1003,20 @@ def _handle_pre(
                 started_at=started_at,
             )
             limited = any(reason.startswith("snapshot_") for reason in skipped.values())
+            placeholders = ",".join("?" for _ in ACTIVE_CAPTURE_STATES)
+            peers = connection.execute(
+                f"SELECT id, overlap_peers FROM hook_captures WHERE worktree_id = ? AND status IN ({placeholders})",
+                (worktree_id, *ACTIVE_CAPTURE_STATES),
+            ).fetchall()
             overlap = _active_count(connection, worktree_id) > 0
             if overlap:
-                placeholders = ",".join("?" for _ in ACTIVE_CAPTURE_STATES)
-                connection.execute(
-                    f"UPDATE hook_captures SET status = 'contaminated' WHERE worktree_id = ? AND status IN ({placeholders})",
-                    (worktree_id, *ACTIVE_CAPTURE_STATES),
-                )
+                # Each side of an overlap keeps the other's id, so its
+                # completion can tell which changed files the peer owns.
+                for peer in peers:
+                    connection.execute(
+                        "UPDATE hook_captures SET overlap_peers = ? WHERE id = ?",
+                        (json.dumps(_peer_ids(peer["overlap_peers"]) + [capture_id]), peer["id"]),
+                    )
                 active_units = connection.execute(
                     """
                     SELECT unit_key, attribution_session_id
@@ -949,8 +1042,8 @@ def _handle_pre(
                 INSERT INTO hook_captures(
                     id, worktree_id, harness, native_session_id, tool_use_id,
                     turn_id, ledger_session_id, base_commit, started_at, status,
-                    snapshot_scope, snapshot_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    snapshot_scope, snapshot_state, overlap_peers
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     capture_id,
@@ -962,9 +1055,10 @@ def _handle_pre(
                     ledger_session_id,
                     base_commit,
                     started_at,
-                    "contaminated" if overlap else ("limited" if limited else "pending"),
+                    "limited" if limited else "pending",
                     snapshot_scope,
-                    None if limited or overlap else snapshot_state,
+                    None if limited else snapshot_state,
+                    json.dumps([peer["id"] for peer in peers]) if peers else None,
                 ),
             )
             for path in ([] if limited else sorted(set(before) | set(skipped))):
@@ -990,7 +1084,7 @@ def _handle_pre(
     warnings = _skipped_warning(skipped)
     if overlap:
         warnings.append(
-            "Overlapping native tool captures were detected; their file deltas will remain unknown."
+            "Overlapping native tool captures were detected; each changed file goes to the tool that named it or saw it first."
         )
     elif limited:
         warnings.append(
@@ -1316,6 +1410,8 @@ def _handle_post(
                         for path, reason in after_skips.items()
                         if reason == "ignored_preexisting_directory"
                     )
+                    peers = _peer_captures(connection, capture["overlap_peers"])
+                    deferred = 0
                     paths = set(before_rows) | set(before_contents) | set(after) | set(after_skips)
                     for path in sorted(paths):
                         if (
@@ -1328,6 +1424,15 @@ def _handle_post(
                         after_content = after.get(path)
                         if before_content == after_content:
                             continue
+                        if peers:
+                            skip, before_content = _shared_path(
+                                connection, capture, peers, path, before_content, after_content
+                            )
+                            if skip:
+                                deferred += 1
+                                continue
+                            if before_content == after_content:
+                                continue
                         connection.execute(
                             """
                             INSERT INTO edits(
@@ -1347,6 +1452,10 @@ def _handle_post(
                             ),
                         )
                         changed_files.append(path)
+                    if deferred:
+                        warnings.append(
+                            f"{deferred} changed file(s) belong to an overlapping tool that named them; that tool's completion records them."
+                        )
                     warnings.extend(_skipped_warning(after_skips))
 
                 completed_at = _utc_now()
