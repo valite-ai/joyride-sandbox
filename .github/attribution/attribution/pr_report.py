@@ -467,6 +467,15 @@ def _canonical_harness(value: Any) -> Any:
         return value
 
 
+_IDENTITY_HASH = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _insight_identity(session: Mapping[str, Any]) -> str | None:
+    """Return the session's native identity hash, from the ID or a note that kept it."""
+    identity = native_identity_hash(session) or session.get("workflow_identity")
+    return identity if isinstance(identity, str) and _IDENTITY_HASH.fullmatch(identity) else None
+
+
 def _encoded_size(value: Any) -> int:
     return len(json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -537,6 +546,10 @@ def _insights(
         record: dict[str, Any] = {
             "id": session_id,
             "actor_kind": session["actor_kind"],
+            # The hash of the native session ID lets the service recognize
+            # this session when the same computer imports its history later,
+            # without the ID itself entering the shared report.
+            "workflow_identity": _insight_identity(session),
             "model": model if model != "unknown" and insight_label(model) else None,
             "harness": harness if insight_label(harness) else None,
             "effort": local.get("effort") or _effort(session.get("effort_level")),

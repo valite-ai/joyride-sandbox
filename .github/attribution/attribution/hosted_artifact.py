@@ -518,12 +518,16 @@ def _insight_tokens(value: Any, label: str) -> None:
 
 
 def _validate_insight_session(value: Any) -> str:
+    # Reports from before the history import carry no identity hash.
     record = _keys(
         value, set(_INSIGHT_SESSION_KEYS), "insights session",
-        optional={"tokens", "by_model"},
+        optional={"tokens", "by_model", "workflow_identity"},
     )
     if not insight_label(record["id"], MAX_INSIGHT_ID_CHARS):
         raise ValueError("Artifact insights session ID is invalid.")
+    identity = record.get("workflow_identity")
+    if identity is not None and (not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity)):
+        raise ValueError("Artifact insights session identity is invalid.")
     # Each value is type-checked before a membership test, which an unhashable
     # value would otherwise turn into a TypeError instead of a refusal.
     if (

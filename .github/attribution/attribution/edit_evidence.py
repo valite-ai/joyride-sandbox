@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .capture import MAX_TEXT_BYTES
 from .hook_events import classify_tool
@@ -293,6 +293,7 @@ def _updated_content(content: bytes, chunks: list[_Chunk]) -> bytes | None:
 
 def expected_edit(
     provider: str, tool_name: str, tool_input: dict, cwd: Path, repo: Path,
+    *, read_targets_for_edit: Callable[[Path, Iterable[str]], dict[str, bytes | None] | None] | None = None,
 ) -> tuple[dict[str, bytes | None], dict[str, bytes | None]] | None:
     """Return targeted before/expected bytes for a supported native edit.
 
@@ -300,6 +301,7 @@ def expected_edit(
     invokes the tool or writes source files, directories, or the Git index.
     """
     try:
+        reader = read_targets_for_edit or read_targets
         if not isinstance(tool_input, dict):
             return None
         kind = classify_tool(provider, tool_name)
@@ -310,7 +312,7 @@ def expected_edit(
             if operations is None:
                 return None
             paths = [path for operation in operations for path in (operation.path, operation.destination) if path is not None]
-            before = read_targets(repo, paths)
+            before = reader(repo, paths)
             if before is None:
                 return None
             expected = dict(before)
@@ -336,7 +338,7 @@ def expected_edit(
             path = _relative_path(tool_input.get("file_path"), cwd, repo)
             if path is None:
                 return None
-            before = read_targets(repo, [path])
+            before = reader(repo, [path])
             if before is None:
                 return None
             if kind == "write":

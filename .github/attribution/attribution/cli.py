@@ -17,8 +17,8 @@ from . import __version__
 
 _HOOK_INPUT_LIMIT = 2 * 1024 * 1024
 _PUBLIC_COMMANDS = (
-    "{install,uninstall,report,show,serve,code,why,status,self-test,run,task,session,hook,"
-    "recover,harnesses,hook-template,record,hosted,doctor,demo,help}"
+    "{install,uninstall,connect,report,show,serve,code,why,status,self-test,run,task,session,hook,"
+    "recover,harnesses,hook-template,record,hosted,import-history,doctor,demo,help}"
 )
 
 
@@ -32,11 +32,13 @@ class _ArgumentParser(argparse.ArgumentParser):
             ", '_collector'",
             ", '_share'",
             ", '_repair-hooks'",
+            ", '_device-job'",
             ", _hook",
             ", _git-hook",
             ", _collector",
             ", _share",
             ", _repair-hooks",
+            ", _device-job",
         ):
             message = message.replace(hidden, "")
         super().error(message)
@@ -136,6 +138,15 @@ def parser() -> argparse.ArgumentParser:
         help="Hosted HTTPS origin that receives --code (default: ATTRIBUTION_HOSTED_URL)",
     )
     _repo_option(install)
+
+    connect = commands.add_parser(
+        "connect", help="Connect this computer to your Joyride account for past work imports"
+    )
+    connect.add_argument("--code", required=True, help="One-time code from the Joyride page")
+    connect.add_argument(
+        "--hosted-url",
+        help="Hosted HTTPS origin that receives --code (default: ATTRIBUTION_HOSTED_URL)",
+    )
 
     uninstall = commands.add_parser(
         "uninstall", help="Disable tracking while preserving attribution data"
@@ -307,6 +318,18 @@ def parser() -> argparse.ArgumentParser:
     hosted_setup.add_argument("--json", action="store_true", help="Print the setup result as JSON")
     _repo_option(hosted_setup)
 
+    history = commands.add_parser(
+        "import-history", help="Preview and upload old Claude Code and Codex session metadata"
+    )
+    _repo_option(history)
+    history.add_argument("--repository", required=True, help="Expected GitHub owner/repository")
+    history.add_argument("--hosted-url", help="Hosted HTTPS origin")
+    history.add_argument("--code", help="Short-lived history import credential")
+    history.add_argument("--since", help="Include sessions active on or after YYYY-MM-DD")
+    history.add_argument("--dry-run", action="store_true", help="Preview without network access")
+    history.add_argument("--json", action="store_true", help="Print the selected metadata as JSON")
+    history.add_argument("--yes", action="store_true", help="Approve upload without a terminal prompt")
+
     run = commands.add_parser("run", help="Capture one coding session and infer its task")
     task_choice = run.add_mutually_exclusive_group()
     task_choice.add_argument("--feature", help="Legacy feature label; creates or selects that task")
@@ -416,6 +439,7 @@ def parser() -> argparse.ArgumentParser:
     share = commands.add_parser("_share", add_help=False)
     share.add_argument("hook_arguments", nargs=argparse.REMAINDER)
     commands.add_parser("_repair-hooks", add_help=False)
+    commands.add_parser("_device-job", add_help=False)
     return result
 
 
@@ -516,16 +540,63 @@ def _read_hook_payload() -> dict[str, Any]:
     return payload
 
 
+def _pair(hosted_url: str, code: str) -> dict[str, Any]:
+    """Redeem the one-time code, store the device credential, and start the collector."""
+
+    from .device import device_descriptor, save_credential
+    from .install_code import redeem_install_code
+    from .terminal import safe_text
+
+    redeemed = redeem_install_code(hosted_url, code, device=device_descriptor())
+    device = redeemed.get("device")
+    if not device:
+        return redeemed
+    save_credential(hosted_url, device["id"], device["token"], redeemed["login"])
+    _emit(
+        f"This computer is connected to Joyride as {safe_text(redeemed['login'])}. "
+        "Past work imports start from the Past work page."
+    )
+    from .hook_client import DISABLE_TELEMETRY_ENV
+
+    if os.environ.get(DISABLE_TELEMETRY_ENV) == "1":
+        return redeemed
+    from .telemetry import TelemetryError, ensure_collector
+
+    try:
+        ensure_collector()
+    except TelemetryError as exc:
+        _emit(
+            f"The local collector did not start: {safe_text(str(exc))} "
+            "It starts with your next coding session.",
+            stream=sys.stderr,
+        )
+    return redeemed
+
+
+def _device_status() -> dict[str, Any]:
+    """Describe the connected computer without its token."""
+
+    from .device import load_credential
+
+    credential = load_credential()
+    if credential is None:
+        return {"connected": False}
+    return {
+        "connected": True, "hosted_url": credential["hosted_url"],
+        "login": credential["login"], "device_id": credential["device_id"],
+    }
+
+
 def _report_install(hosted_url: str | None, code: str | None) -> None:
     """Send a team invite's one-time code after a finished install."""
 
     if code is None or hosted_url is None:
         return
-    from .install_code import InstallCodeError, redeem_install_code
+    from .install_code import InstallCodeError
     from .terminal import safe_text
 
     try:
-        redeemed = redeem_install_code(hosted_url, code)
+        redeemed = _pair(hosted_url, code)
     except InstallCodeError as exc:
         # The install itself succeeded, so a refused code only loses the early signal.
         _emit(
@@ -557,6 +628,57 @@ def main(argv: list[str] | None = None) -> int:
                 "For another repository or target:\n"
                 "  joyride --repo /path/to/repo report --json --target main"
             )
+            return 0
+        if args.action == "import-history":
+            from .history_import import discover, upload
+
+            envelope = discover(_selected_repo(args), args.repository, since=args.since)
+            sessions = envelope["sessions"]
+            if args.json:
+                _emit_json(envelope)
+            else:
+                _emit(f"History import preview for {envelope['repository']}: {len(sessions)} sessions")
+                for session in sessions:
+                    usage = session["usage"]
+                    _emit(
+                        f"  {session['provider']} {session['native_session_id']} "
+                        f"{session['started_at'] or '?'} to {session['last_activity_at'] or '?'} "
+                        f"branch={session['branch'] or '?'} model={session['model'] or '?'} "
+                        f"requests={len(usage)} prompts={session['prompt_count']} "
+                        f"tools={session['tool_call_count']} {session['completeness']}"
+                    )
+                    for claim in session["created_commits"]:
+                        reason = ("matches recorded edits" if claim["evidence"] == "recorded_edit"
+                                  else "recorded in the session")
+                        _emit(f"    Commit {claim['sha']}: {reason}")
+                if envelope["skipped"]:
+                    _emit("Skipped: " + ", ".join(
+                        f"{item['reason']}={item['count']}" for item in envelope["skipped"]
+                    ))
+                _emit("Upload contains only the previewed metadata and numeric usage; no session text or paths.")
+            if args.dry_run or not sessions:
+                return 0
+            if not args.hosted_url or not args.code:
+                raise ValueError("upload needs --hosted-url and --code; use --dry-run to preview only")
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    raise ValueError("upload needs interactive approval or --yes")
+                sys.stdout.write("Upload these session records? [y/N] ")
+                sys.stdout.flush()
+                if sys.stdin.readline().strip().lower() not in {"y", "yes"}:
+                    _emit("History import cancelled.")
+                    return 0
+            result = upload(envelope, args.hosted_url, args.code)
+            if args.json:
+                _emit_json({"upload": result})
+            else:
+                session_count = len(sessions)
+                request_count = result["request_count"]
+                _emit(
+                    f"History import uploaded: {session_count} "
+                    f"{'session' if session_count == 1 else 'sessions'} in {request_count} "
+                    f"{'request' if request_count == 1 else 'requests'}."
+                )
             return 0
 
         if args.action == "_hook":
@@ -606,6 +728,19 @@ def main(argv: list[str] | None = None) -> int:
 
             repair_user_hooks()
             return 0
+        if args.action == "_device-job":
+            from .device_worker import run_job_from_stdin
+
+            return run_job_from_stdin(sys.stdin.buffer)
+
+        if args.action == "connect":
+            hosted_url = args.hosted_url or os.environ.get("ATTRIBUTION_HOSTED_URL")
+            if not hosted_url:
+                raise ValueError("connect needs --hosted-url or ATTRIBUTION_HOSTED_URL.")
+            if not _pair(hosted_url, args.code).get("device"):
+                raise ValueError("The hosted service did not connect this computer.")
+            return 0
+
         if args.action == "_collector":
             from .telemetry import _collector_process
 
@@ -646,10 +781,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.action == "uninstall":
             if args.user:
+                from .device import clear_credential
                 from .terminal import render_user_setup
                 from .user_install import uninstall_user_hooks
 
-                _emit(render_user_setup(uninstall_user_hooks(), installed=False))
+                status = uninstall_user_hooks()
+                clear_credential()
+                _emit(render_user_setup(status, installed=False))
                 return 0
             from .install import uninstall_repo
 
@@ -945,6 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
             selected = _selected_repo(args)
             installation = installation_status(selected)
             installation["user_scope"] = user_install_status()
+            installation["device"] = _device_status()
             try:
                 from .costing import unpriced_request_counts
                 from .telemetry import query_events

@@ -1834,6 +1834,17 @@ def render_status(
                     machine_hooks += f" - {message}"
                 break
         _append_field(lines, "Machine hooks", machine_hooks, output_width, full=True)
+    device = _mapping(status.get("device"))
+    if device:
+        if device.get("connected") is True:
+            connected = (
+                f"{safe_text(device.get('hosted_url'))} as "
+                f"{safe_text(device.get('login')) or 'unknown'} "
+                f"(device {safe_text(device.get('device_id'))})"
+            )
+        else:
+            connected = "not connected"
+        _append_field(lines, "Connected computer", connected, output_width, full=True)
     if status.get("git_repository") is False:
         lines.extend(_warning_lines(status.get("warnings"), width=output_width))
         return "\n".join(_paint_common(lines, use_color)).rstrip() + "\n"

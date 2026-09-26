@@ -1787,6 +1787,7 @@ def serve(
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        poller.stop()
         server.server_close()
 
 
@@ -2248,6 +2249,12 @@ def _collector_process(
         "started_at_unix": int(time.time()),
     }
     _write_runtime(directory, runtime)
+    from .device_worker import DevicePoller
+
+    # A connected computer claims past work imports from here. Without a
+    # credential the thread only sleeps.
+    poller = DevicePoller(directory)
+    poller.start()
 
     def request_shutdown(_signum: int, _frame: Any) -> None:
         _stop_in_background(server, hooks)
@@ -2273,6 +2280,7 @@ def _collector_process(
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        poller.stop()
         server.server_close()
         # Worker threads end with the process, so no accepted event may still
         # be queued or running when this function returns.
