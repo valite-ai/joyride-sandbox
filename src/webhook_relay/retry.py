@@ -13,6 +13,7 @@ class RetryPolicy:
     multiplier: float = 2.0
     max_delay: float = 60.0
     max_age: float = 3600.0
+    max_retry_after: float = 300.0
 
     def next_delay(
         self,
@@ -29,7 +30,7 @@ class RetryPolicy:
         )
         delay = random.uniform(0.0, raw_delay)
         if retry_after is not None:
-            delay = max(delay, min(self.max_delay, max(0.0, retry_after)))
+            delay = max(delay, min(self.max_retry_after, max(0.0, retry_after)))
 
         if age + delay > self.max_age:
             return None
