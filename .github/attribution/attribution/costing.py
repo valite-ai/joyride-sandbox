@@ -697,6 +697,7 @@ def allocate_session_usage(
                     "has_usd": False,
                     "has_credits": False,
                     "has_equivalent_usd": False,
+                    "credits_without_equivalent": False,
                     **({"_by_model": {}, "_priced": []} if detail else {}),
                 },
             )
@@ -715,6 +716,11 @@ def allocate_session_usage(
                     usage["has_credits"] = True
                 elif field == "codex_api_equivalent_usd":
                     usage["has_equivalent_usd"] = True
+            if (
+                _number(event_values.get("credits")) is not None
+                and _number(event_values.get("codex_api_equivalent_usd")) is None
+            ):
+                usage["credits_without_equivalent"] = True
             if is_request:
                 usage["request_count"] += weight
                 if request_has_cost:
@@ -745,6 +751,10 @@ def allocate_session_usage(
         has_usd = bool(usage.pop("has_usd"))
         has_credits = bool(usage.pop("has_credits"))
         has_equivalent_usd = bool(usage.pop("has_equivalent_usd"))
+        # A comparison that misses the credits of one request would read as
+        # the price of all of them, so such a session keeps none.
+        if usage.pop("credits_without_equivalent"):
+            has_equivalent_usd = False
         usage["estimated_cost_usd"] = (
             round(usage["estimated_cost_usd"], 10) if has_usd else None
         )

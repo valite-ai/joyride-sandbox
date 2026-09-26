@@ -844,11 +844,10 @@ def build_pr_report(
                             group["_estimates"].append(estimated)
                         if credits is not None:
                             group["_credits"].append(credits)
-                            equivalent = _amount(
+                            # None marks credits the comparison misses.
+                            group["_equivalents"].append(_amount(
                                 allocated.get("codex_api_equivalent_usd")
-                            )
-                            if equivalent is not None:
-                                group["_equivalents"].append(equivalent)
+                            ))
                         if allocated.get("cost_complete") is False:
                             # The same rule the local report applies: a cost
                             # that priced only some of the requests of a
@@ -894,7 +893,9 @@ def build_pr_report(
             group["estimated_cost_usd"] = round(math.fsum(estimates), 10)
         if credits:
             group["codex_credits"] = round(math.fsum(credits), 10)
-        if equivalents:
+        # A comparison that misses the credits of one session would read as
+        # the price of all of them, so such a row keeps none.
+        if equivalents and None not in equivalents:
             group["codex_api_equivalent_usd"] = round(math.fsum(equivalents), 10)
         group["cost_complete"] = (
             not unknown_costs and not partial_costs and membership_complete
@@ -1173,20 +1174,13 @@ def _plural(value: int, singular: str, plural: str) -> str:
     return f"{value:,} {singular if value == 1 else plural}"
 
 
-def _money(value: float | None, complete: bool) -> str:
+def _money(value: float | None) -> str:
     if value is None:
         return "Unknown"
     if value == 0:
         # A negative zero from an older record would print as "$-0.00".
         value = 0.0
-    return f"${value:.2f}" + (" (partial)" if not complete else "")
-
-
-def _api_equivalent(value: float) -> str:
-    """Show the standard-rate dollar comparison of a credit-priced session."""
-    if 0 < value < 0.01:
-        return "<$0.01"
-    return f"${value:,.2f}"
+    return f"${value:.2f}"
 
 
 def _credit_text(value: float) -> str:
@@ -1198,30 +1192,45 @@ def _credit_text(value: float) -> str:
     return f"{value:,.2f} Codex credits"
 
 
-def _credit_cost(
-    reported: float | None,
-    estimated: float | None,
-    credits: float,
-    equivalent: float | None,
-    complete: bool,
-) -> str:
-    """Render a cost a Codex subscription priced in credits, never as dollars.
+def _estimate(entry: dict[str, Any]) -> float | None:
+    """Return the estimated dollars of an entry, or None where it has none.
 
-    A session that also holds a reported or estimated dollar cost shows both
-    units side by side, so no reader reads one number as the sum of the other.
+    Claude Code prices each request at the API rate. A Codex request on a
+    ChatGPT sign-in is priced in credits and carries the API price of the same
+    tokens, and a request with no credit price carries only its API price. The
+    footer adds both, so a Codex session reads on the basis a Claude one does.
     """
-    if reported is not None or estimated is not None:
-        usd = (reported or 0.0) + (estimated or 0.0)
-        text = f"${usd:.2f} USD + {_credit_text(credits)}"
-    else:
-        text = _credit_text(credits)
-        if equivalent is not None:
-            text += f" ≈ {_api_equivalent(equivalent)}"
-    return text if complete else f"{text} (partial)"
+    estimated = _amount(entry.get("estimated_cost_usd"))
+    equivalent = _amount(entry.get("codex_api_equivalent_usd"))
+    if estimated is None and equivalent is None:
+        return None
+    return (estimated or 0.0) + (equivalent or 0.0)
+
+
+def _unconverted_credits(entry: dict[str, Any]) -> float | None:
+    """Return the Codex credits that the footer cannot show as dollars.
+
+    A model can publish a credit rate but no API price for a request, as
+    gpt-5.6-cyber does in Fast mode. An entry with such credits carries no
+    comparison at all, so all of its credits stay in their own unit.
+    """
+    if _amount(entry.get("codex_api_equivalent_usd")) is not None:
+        return None
+    return _amount(entry.get("codex_credits"))
+
+
+def _credit_cost(
+    reported: float | None, estimated: float | None, credits: float
+) -> str:
+    """Render a cost that holds credits beside its dollars, never added in."""
+    text = _credit_text(credits)
+    if estimated is not None:
+        return _estimated_money(reported, estimated, f" + {text}")
+    return text if reported is None else f"${reported:.2f} + {text}"
 
 
 def _estimated_money(
-    reported: float | None, estimated: float, complete: bool, suffix: str = ""
+    reported: float | None, estimated: float, suffix: str = ""
 ) -> str:
     """Return a cost that holds an estimate, saying that it holds one.
 
@@ -1232,8 +1241,7 @@ def _estimated_money(
     cost. A report with no estimate never reaches this function.
     """
     basis = "reported + estimated" if reported is not None else "estimated"
-    text = f"${(reported or 0.0) + estimated:.2f} {basis}{suffix}"
-    return text if complete else f"{text} (partial)"
+    return f"${(reported or 0.0) + estimated:.2f} {basis}{suffix}"
 
 
 def fallback_narrative(report: dict[str, Any]) -> str | None:
@@ -1357,29 +1365,20 @@ def _cost_cell(entry: dict[str, Any]) -> str:
 
 
 def _priced_cost(entry: dict[str, Any]) -> str:
-    credits = _amount(entry.get("codex_credits"))
+    estimated = _estimate(entry)
+    credits = _unconverted_credits(entry)
     if credits is not None:
-        return _credit_cost(
-            _amount(entry.get("reported_cost_usd")),
-            _amount(entry.get("estimated_cost_usd")),
-            credits,
-            _amount(entry.get("codex_api_equivalent_usd")),
-            entry["cost_complete"],
-        )
-    estimated = entry.get("estimated_cost_usd")
+        return _credit_cost(_amount(entry.get("reported_cost_usd")), estimated, credits)
     if estimated is None:
-        return _money(entry["reported_cost_usd"], entry["cost_complete"])
-    return _estimated_money(
-        entry["reported_cost_usd"], estimated, entry["cost_complete"]
-    )
+        return _money(entry["reported_cost_usd"])
+    return _estimated_money(entry["reported_cost_usd"], estimated)
 
 
 def _total_cost_phrase(report: dict[str, Any]) -> str:
     """Say what this pull request cost, and on which basis that number stands."""
     reported = report.get("reported_cost_usd")
-    estimated = report.get("estimated_cost_usd")
-    credits = _amount(report.get("codex_credits"))
-    partial = "" if report["cost_complete"] else " (partial)"
+    estimated = _estimate(report)
+    credits = _unconverted_credits(report)
     if reported is None and estimated is None and credits is None:
         return "Unknown total reported cost"
     if reported is not None or estimated is not None:
@@ -1394,12 +1393,8 @@ def _total_cost_phrase(report: dict[str, Any]) -> str:
         # Credits ride beside the dollars in their own unit, never added in.
         if credits is not None:
             phrase += f" + {_credit_text(credits)}"
-        return f"{phrase}{partial}"
-    equivalent = _amount(report.get("codex_api_equivalent_usd"))
-    phrase = f"{_credit_text(credits)} total"
-    if equivalent is not None:
-        phrase += f" ≈ {_api_equivalent(equivalent)}"
-    return f"{phrase}{partial}"
+        return phrase
+    return f"{_credit_text(credits)} total"
 
 
 def render_footer(report: dict[str, Any], *, details_url: str | None = None) -> str:
@@ -1439,6 +1434,10 @@ def render_footer(report: dict[str, Any], *, details_url: str | None = None) -> 
             report.get("sessions_without_usage", 0),
             escape=_label,
         )
+        if not unknown and not report["cost_complete"]:
+            # No cost carries a partial mark, so this line alone says that
+            # part of the cost is unknown, also when no reason was recorded.
+            unknown = "reason not recorded"
         if unknown:
             rows.extend([f"Unknown cost: {unknown}", ""])
     if details_url:

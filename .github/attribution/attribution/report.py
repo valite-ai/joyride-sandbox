@@ -1877,11 +1877,15 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                 "credits": None,
                 "equivalent": None,
             }
+        credits = usage.get("codex_credits")
         return {
             "reported": None,
             "estimated": usage.get("estimated_cost_usd"),
-            "credits": usage.get("codex_credits"),
-            "equivalent": usage.get("codex_api_equivalent_usd"),
+            "credits": credits,
+            # A comparison prices credits, so one without them prices nothing.
+            "equivalent": (
+                usage.get("codex_api_equivalent_usd") if credits is not None else None
+            ),
         }
 
     def has_cost(session: dict[str, Any]) -> bool:
@@ -1906,6 +1910,7 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     estimated_costs: list[float] = []
     credit_costs: list[float] = []
     equivalent_costs: list[float] = []
+    credits_without_equivalent = False
     counted_tokens: list[int] = []
     missing_cost = 0
     missing_tokens = 0
@@ -1955,6 +1960,8 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                 value = values[field]
                 if value is not None:
                     destination.append(float(value))
+            if values["credits"] is not None and values["equivalent"] is None:
+                credits_without_equivalent = True
             telemetry = session.get("telemetry")
             complete = (
                 session.get("cost_usd") is not None
@@ -1982,8 +1989,12 @@ def _task_economics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "codex_credits": (
             round(math.fsum(credit_costs), 10) if credit_costs else None
         ),
+        # A comparison that misses the credits of one session would read as
+        # the price of all of them, so such a total keeps none.
         "codex_api_equivalent_usd": (
-            round(math.fsum(equivalent_costs), 10) if equivalent_costs else None
+            round(math.fsum(equivalent_costs), 10)
+            if equivalent_costs and not credits_without_equivalent
+            else None
         ),
         "cost_covered_sessions": cost_covered_sessions,
         "cost_complete": ai_session_count > 0 and missing_cost == 0,
