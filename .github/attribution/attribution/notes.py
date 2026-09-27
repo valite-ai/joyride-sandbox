@@ -329,6 +329,13 @@ def _transplanted_chain(
         if not set(target_added) <= set(_lines(candidate.after)):
             continue
         chain = _exact_chain(edits, candidate.after)
+        # The walk back crosses sessions, so it passes the commit's own parent
+        # content wherever an earlier edit produced that content. The change
+        # this commit repeats starts there.
+        start = next(
+            (index for index in range(len(chain) - 1, -1, -1) if chain[index].before == old), 0
+        )
+        chain = chain[start:]
         first, last = chain[0].before, chain[-1].after
         first_lines, last_lines = _lines(first), _lines(last)
         chain_removed, chain_added = _line_change(first, last)

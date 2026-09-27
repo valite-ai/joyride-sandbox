@@ -38,6 +38,10 @@ _MAX_NOTE_LINES = 1_000_000
 _MAX_TARGET_FILES = 2_000
 _MAX_TARGET_FILE_BYTES = 1024 * 1024
 _MAX_TARGET_TOTAL_BYTES = 32 * 1024 * 1024
+# The ledger also holds every edit, capture, and trace event, so its file grows
+# far faster than the session and task rows a report reads. The bound is on
+# those rows.
+_MAX_LEDGER_ROWS = 100_000
 _GIT_TIMEOUT_SECONDS = 30
 _OID_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _BLAME_HEADER_RE = re.compile(
@@ -565,14 +569,20 @@ def _normalise_session(
     return result
 
 
+def _too_many_rows(connection: sqlite3.Connection, table: str) -> bool:
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return exists is not None and connection.execute(
+        f"SELECT COUNT(*) FROM {table}"
+    ).fetchone()[0] > _MAX_LEDGER_ROWS
+
+
 def _load_local_sessions(
     common_dir: Path, warnings: _Warnings
 ) -> list[dict[str, Any]]:
     database = common_dir / "attribution" / "ledger.sqlite3"
     if not database.is_file():
-        return []
-    if database.stat().st_size > 256 * 1024 * 1024:
-        warnings.add("The local attribution ledger is too large to read safely.")
         return []
     uri = f"file:{quote(str(database))}?mode=ro"
     has_unscoped_sessions = False
@@ -580,6 +590,9 @@ def _load_local_sessions(
         connection = sqlite3.connect(uri, uri=True, timeout=1)
         connection.row_factory = sqlite3.Row
         try:
+            if _too_many_rows(connection, "sessions"):
+                warnings.add("The local attribution ledger is too large to read safely.")
+                return []
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
             }
@@ -1033,7 +1046,7 @@ def _normalise_task(
 
 def _load_local_tasks(common_dir: Path, warnings: _Warnings) -> list[dict[str, Any]]:
     database = common_dir / "attribution" / "ledger.sqlite3"
-    if not database.is_file() or database.stat().st_size > 256 * 1024 * 1024:
+    if not database.is_file():
         return []
     uri = f"file:{quote(str(database))}?mode=ro"
     try:
@@ -1045,7 +1058,7 @@ def _load_local_tasks(common_dir: Path, warnings: _Warnings) -> list[dict[str, A
             ).fetchone()
             rows = connection.execute(
                 "SELECT * FROM tasks ORDER BY updated_at, id"
-            ).fetchall() if exists else []
+            ).fetchall() if exists and not _too_many_rows(connection, "tasks") else []
         finally:
             connection.close()
     except (OSError, sqlite3.Error) as exc:

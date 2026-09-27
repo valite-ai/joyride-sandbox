@@ -40,7 +40,7 @@ from urllib.request import Request, build_opener
 
 from .github_footer import (
     MAX_SNAPSHOT_BYTES, _METADATA_PREFIX, _NoRedirect, _OID, _git_environment, _host_url,
-    _ingest_url, _oidc_token, _report_git_environment, _repository_name,
+    _ingest_url, _oidc_token, _report_git_environment, _repository_name, snapshot_notes,
 )
 from .notes import _BLAME_HEADER, _decode_blame_path
 from .report import (
@@ -898,13 +898,13 @@ def _snapshot_notes(store: Path, remote: str, head: str, expected: str) -> list[
         raise ValueError("Joyride metadata is not valid JSON.") from exc
     if (
         not isinstance(payload, dict)
-        or type(payload.get("version")) is not int or payload["version"] != 1
+        or type(payload.get("version")) is not int or payload["version"] not in (1, 2)
         or payload.get("head_commit") != head
         or not isinstance(payload.get("notes"), list)
         or any(not isinstance(note, dict) for note in payload["notes"])
     ):
         raise ValueError("Joyride metadata does not match this PR head.")
-    return payload["notes"]
+    return snapshot_notes(payload)
 
 
 def _has_commit(repo: Path, sha: str) -> bool:

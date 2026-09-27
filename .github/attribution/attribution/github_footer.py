@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import copy
 import json
 import math
 import os
@@ -28,9 +29,12 @@ from .pr_report import (
     MAX_INSIGHT_MODELS, MAX_INSIGHT_SECONDS, MAX_INSIGHT_TIMELINE_ITEMS, insight_label,
 )
 from .runtime import system_subprocess_environment
+from .workflow import MAX_WORKFLOW_DEPTH
 
 
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+# The notes of a snapshot, as ``snapshot_notes`` rebuilds them from the shared form.
+MAX_EXPANDED_SNAPSHOT_BYTES = 4 * MAX_SNAPSHOT_BYTES
 _MAX_HTTP_BYTES = 16 * 1024 * 1024
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -629,6 +633,65 @@ def _read_traces(repo: Path, environment: dict[str, str], tree: str) -> list[dic
     return traces
 
 
+def snapshot_notes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the notes of a snapshot as the plain form carries them.
+
+    A note of the shared form (version 2) names its session records and its
+    workflow agents by index into the snapshot's ``sessions`` and ``agents``
+    lists. An agent names only lower indexes as its children, so the records
+    hold no cycle, and the rebuilt notes are held to a byte budget, so a small
+    snapshot cannot name one record often enough to exhaust the runner.
+    """
+    if payload["version"] == 1:
+        return payload["notes"]
+    tables = {name: payload.get(name) for name in ("sessions", "agents")}
+    if any(
+        not isinstance(records, list) or any(not isinstance(item, dict) for item in records)
+        for records in tables.values()
+    ):
+        raise ValueError("Joyride metadata has invalid shared records.")
+    sizes = {name: [len(json.dumps(item)) for item in records] for name, records in tables.items()}
+    budget = [MAX_EXPANDED_SNAPSHOT_BYTES]
+
+    def record(name: str, position: Any, below: int) -> dict[str, Any]:
+        if type(position) is not int or not 0 <= position < below:
+            raise ValueError("Joyride metadata names a missing shared record.")
+        budget[0] -= sizes[name][position]
+        if budget[0] < 0:
+            raise ValueError("Joyride metadata exceeds the 32 MiB expanded limit.")
+        return copy.deepcopy(tables[name][position])
+
+    def agent(position: Any, below: int, depth: int) -> dict[str, Any]:
+        if depth > MAX_WORKFLOW_DEPTH:
+            raise ValueError("Joyride metadata nests its agents too deeply.")
+        rebuilt = record("agents", position, below)
+        if not isinstance(rebuilt.get("children"), list):
+            raise ValueError("Joyride metadata has invalid shared records.")
+        rebuilt["children"] = [agent(child, position, depth + 1) for child in rebuilt["children"]]
+        return rebuilt
+
+    notes = []
+    for note in payload["notes"]:
+        sessions = note.get("sessions")
+        workflow = note.get("workflow")
+        if not isinstance(sessions, list) or (
+            workflow is not None
+            and (not isinstance(workflow, dict) or not isinstance(workflow.get("agents"), list))
+        ):
+            raise ValueError("Joyride metadata has an invalid shared note.")
+        rebuilt = {
+            **note,
+            "sessions": [record("sessions", item, len(tables["sessions"])) for item in sessions],
+        }
+        if workflow is not None:
+            rebuilt["workflow"] = {
+                **workflow,
+                "agents": [agent(item, len(tables["agents"]), 1) for item in workflow["agents"]],
+            }
+        notes.append(rebuilt)
+    return notes
+
+
 def _read_snapshot(
     repo: Path, environment: dict[str, str], commit: str, head: str
 ) -> tuple[
@@ -668,7 +731,7 @@ def _read_snapshot(
     if (
         not isinstance(payload, dict)
         or type(payload.get("version")) is not int
-        or payload["version"] != 1
+        or payload["version"] not in (1, 2)
         or payload.get("head_commit") != head
         or not isinstance(payload.get("notes"), list)
         or any(not isinstance(note, dict) for note in payload["notes"])
@@ -677,7 +740,7 @@ def _read_snapshot(
     ):
         raise ValueError("Joyride metadata does not match this PR head.")
     return (
-        payload["notes"], payload.get("tasks", []), _snapshot_usage(payload.get("usage")),
+        snapshot_notes(payload), payload.get("tasks", []), _snapshot_usage(payload.get("usage")),
         traces, _snapshot_session_facts(payload.get("session_facts")),
     )
 

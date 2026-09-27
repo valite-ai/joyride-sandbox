@@ -25,6 +25,8 @@ from .workflow import MAX_WORKFLOW_DEPTH, native_identity_hash
 
 
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+# The notes of a snapshot, as a reader rebuilds them from the shared form.
+MAX_EXPANDED_SNAPSHOT_BYTES = 4 * MAX_SNAPSHOT_BYTES
 _MAX_NOTE_BYTES = 2 * 1024 * 1024
 _MAX_COMMITS = 100_000
 _MAX_CAPTURE_COMMITS = 250
@@ -974,16 +976,16 @@ def build_snapshot(repo: str | Path, head: str, *, record_missing: bool = True) 
     ]
     note_payloads, note_raw_total = _read_note_payloads(root, selected)
     task_payloads, task_raw_total = _read_note_payloads(root, selected_tasks)
-    if note_raw_total + task_raw_total > MAX_SNAPSHOT_BYTES * 4:
-        raise ValueError("Joyride snapshot exceeds 8 MiB")
+    if note_raw_total + task_raw_total > MAX_EXPANDED_SNAPSHOT_BYTES:
+        raise ValueError("Joyride snapshot exceeds 32 MiB")
     notes: list[dict[str, Any]] = []
     note_bytes = 0
     for commit, raw in note_payloads:
         notes.append(sanitize_note(raw, commit))
         # Checking as we accumulate also bounds the total generated metadata.
         note_bytes += len(json.dumps(notes[-1], ensure_ascii=False).encode())
-        if note_bytes > MAX_SNAPSHOT_BYTES:
-            raise ValueError("Joyride snapshot exceeds 8 MiB")
+        if note_bytes > MAX_EXPANDED_SNAPSHOT_BYTES:
+            raise ValueError("Joyride snapshot exceeds 32 MiB")
     tasks: dict[str, dict[str, Any]] = {}
     for commit, raw in task_payloads:
         if (
@@ -998,8 +1000,8 @@ def build_snapshot(repo: str | Path, head: str, *, record_missing: bool = True) 
             task = sanitize_task(source, commit)
             tasks[task["id"]] = task
             note_bytes += len(json.dumps(task, ensure_ascii=False).encode())
-            if note_bytes > MAX_SNAPSHOT_BYTES:
-                raise ValueError("Joyride snapshot exceeds 8 MiB")
+            if note_bytes > MAX_EXPANDED_SNAPSHOT_BYTES:
+                raise ValueError("Joyride snapshot exceeds 32 MiB")
     payload: dict[str, Any] = {
         "version": 1,
         "head_commit": head,
@@ -1017,15 +1019,62 @@ def build_snapshot(repo: str | Path, head: str, *, record_missing: bool = True) 
     return _encode_snapshot(payload)
 
 
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _shared_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the snapshot with each repeated session and agent record stored once.
+
+    Every commit of a long session names the same sessions and the same agent
+    tree, so a branch of many commits repeats them in note after note. This
+    form lists each distinct record once, in the order it first appears, and a
+    note names its records by index. A child agent is listed before its
+    parent, so every index a record names is lower than its own. A reader
+    rebuilds the exact notes of the plain form.
+    """
+    tables: dict[str, tuple[dict[bytes, int], list[dict[str, Any]]]] = {
+        "sessions": ({}, []), "agents": ({}, []),
+    }
+
+    def index(table: str, record: dict[str, Any]) -> int:
+        positions, records = tables[table]
+        key = _canonical(record)
+        if key not in positions:
+            positions[key] = len(records)
+            records.append(record)
+        return positions[key]
+
+    def agent(source: dict[str, Any]) -> int:
+        return index("agents", {**source, "children": [agent(child) for child in source["children"]]})
+
+    notes = []
+    for note in payload["notes"]:
+        shared = {**note, "sessions": [index("sessions", session) for session in note["sessions"]]}
+        if "workflow" in note:
+            shared["workflow"] = {
+                **note["workflow"], "agents": [agent(item) for item in note["workflow"]["agents"]],
+            }
+        notes.append(shared)
+    return {
+        **payload, "version": 2, "notes": notes,
+        "sessions": tables["sessions"][1], "agents": tables["agents"][1],
+    }
+
+
 def _encode_snapshot(payload: dict[str, Any]) -> bytes:
     """Encode one snapshot within its limit, giving up optional facts first.
 
+    Evidence that cannot fit the limit in the plain form takes the shared
+    form, so a snapshot that fits keeps the exact bytes an older reader reads.
     The session facts are optional beside the evidence, and their timelines are
     the largest part of them, so those go first and then the facts themselves.
     """
+    if payload["version"] == 1 and len(_canonical(_evidence(payload))) > MAX_SNAPSHOT_BYTES:
+        payload = _shared_snapshot(payload)
+
     def encoded() -> bytes:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False).encode()
+        return _canonical(payload)
 
     snapshot = encoded()
     facts = payload.get("session_facts")
@@ -1090,6 +1139,10 @@ def build_traces(repo: str | Path, snapshot: bytes) -> dict[str, bytes]:
 _OPTIONAL_SNAPSHOT_KEYS = ("usage", "session_facts")
 
 
+def _evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key not in _OPTIONAL_SNAPSHOT_KEYS}
+
+
 def _refreshed_snapshot(published: bytes, snapshot: bytes) -> bytes | None:
     """Return the published snapshot with this push's telemetry and facts merged in.
 
@@ -1106,11 +1159,7 @@ def _refreshed_snapshot(published: bytes, snapshot: bytes) -> bytes | None:
         return None
     if not isinstance(earlier, dict) or not isinstance(current, dict):
         return None
-
-    def evidence(payload: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in payload.items() if key not in _OPTIONAL_SNAPSHOT_KEYS}
-
-    if evidence(earlier) != evidence(current):
+    if _evidence(earlier) != _evidence(current):
         return None
     for key in _OPTIONAL_SNAPSHOT_KEYS:
         merged = {
