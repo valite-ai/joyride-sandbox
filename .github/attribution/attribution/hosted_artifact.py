@@ -371,7 +371,7 @@ def build_artifact(
         "files": {},
         "completeness": {"status": "complete", "partial_files": 0, "reasons": []},
     }
-    partial_reasons: list[str] = []
+    detailed_paths: set[str] = set()
     # The encoded size of the artifact so far, kept by adding each member's
     # own encoding, so the summary and its insights are encoded once rather
     # than again for every file. Canonical JSON has no whitespace, so a member
@@ -393,8 +393,7 @@ def build_artifact(
                 projection = _projection(
                     root, raw, refs, repository_name=repository,
                 )
-                if projection["completeness"]["status"] == "partial":
-                    partial_reasons.extend(projection["completeness"]["reasons"])
+                detailed_paths.add(path)
             except (OSError, ValueError) as exc:
                 reason = "Detailed code history is unavailable: " + str(exc)[:384]
                 projection = _stub(path, refs, reason, repository=repository, head=head_sha)
@@ -402,8 +401,7 @@ def build_artifact(
         if size + member + len(canonical_json(projection)) > MAX_ARTIFACT_BYTES:
             reason = "Detailed code history was omitted to keep the artifact within its 3 MiB limit."
             projection = _stub(path, refs, reason, repository=repository, head=head_sha)
-        if projection["completeness"]["status"] == "partial":
-            partial_reasons.extend(projection["completeness"]["reasons"])
+            detailed_paths.discard(path)
         artifact["files"][path] = projection
         size += member + len(canonical_json(projection))
         entry = {
@@ -415,18 +413,41 @@ def build_artifact(
         } | {"completeness": deepcopy(projection["completeness"])}
         size += len(canonical_json(entry)) + bool(artifact["file_index"])
         artifact["file_index"].append(entry)
-    partial_files = sum(
-        item["completeness"]["status"] == "partial" for item in artifact["file_index"]
-    )
-    reasons = list(dict.fromkeys([*listing.get("warnings", []), *partial_reasons]))
-    artifact["completeness"] = {
-        "status": "partial" if partial_files or listing.get("truncated") else "complete",
-        "partial_files": partial_files,
-        "reasons": [str(item)[:512] for item in reasons[:100]],
-    }
-    artifact["digest"] = artifact_digest(artifact)
-    if len(canonical_json(artifact)) > MAX_ARTIFACT_BYTES:
-        raise ValueError("Source-free PR artifact exceeds the 3 MiB hosted request limit.")
+    def seal() -> None:
+        partial_files = sum(
+            item["completeness"]["status"] == "partial" for item in artifact["file_index"]
+        )
+        reasons = list(dict.fromkeys([
+            *listing.get("warnings", []),
+            *(reason for projection in artifact["files"].values()
+              for reason in projection["completeness"]["reasons"]),
+        ]))
+        artifact["completeness"] = {
+            "status": "partial" if partial_files or listing.get("truncated") else "complete",
+            "partial_files": partial_files,
+            "reasons": [str(item)[:512] for item in reasons[:100]],
+        }
+        artifact["digest"] = artifact_digest(artifact)
+
+    seal()
+    while len(canonical_json(artifact)) > MAX_ARTIFACT_BYTES:
+        reason = "Detailed code history was omitted to keep the artifact within its 3 MiB limit."
+        candidates = []
+        for path, projection in artifact["files"].items():
+            if path not in detailed_paths:
+                continue
+            stub = _stub(path, projection["source_refs"], reason,
+                         repository=repository, head=head_sha)
+            savings = len(canonical_json(projection)) - len(canonical_json(stub))
+            if savings > 0:
+                candidates.append((savings, path, stub))
+        if not candidates:
+            raise ValueError("Source-free PR artifact exceeds the 3 MiB hosted request limit.")
+        _, path, stub = max(candidates, key=lambda item: (item[0], item[1]))
+        artifact["files"][path] = stub
+        detailed_paths.remove(path)
+        next(item for item in artifact["file_index"] if item["path"] == path)["completeness"] = stub["completeness"]
+        seal()
     return validate_artifact(artifact)
 
 
