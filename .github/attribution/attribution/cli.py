@@ -18,7 +18,7 @@ from . import __version__
 _HOOK_INPUT_LIMIT = 2 * 1024 * 1024
 _PUBLIC_COMMANDS = (
     "{install,uninstall,connect,report,show,serve,code,why,status,self-test,run,task,session,hook,"
-    "recover,harnesses,hook-template,record,hosted,import-history,doctor,demo,help}"
+    "recover,harnesses,hook-template,record,hosted,import-history,doctor,next,replay,demo,help}"
 )
 
 
@@ -128,6 +128,15 @@ def parser() -> argparse.ArgumentParser:
         "--user",
         action="store_true",
         help="Install the harness hooks once for this machine",
+    )
+    install.add_argument(
+        "--advice",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "With --user, start each new Claude Code and Codex session with Joyride's top "
+            "suggestion for its repository; --no-advice removes it (default: unchanged)"
+        ),
     )
     install.add_argument(
         "--code",
@@ -319,7 +328,7 @@ def parser() -> argparse.ArgumentParser:
     _repo_option(hosted_setup)
 
     history = commands.add_parser(
-        "import-history", help="Preview and upload old Claude Code and Codex session metadata"
+        "import-history", help="Preview and upload old Claude Code and Codex sessions with their traces"
     )
     _repo_option(history)
     history.add_argument("--repository", required=True, help="Expected GitHub owner/repository")
@@ -327,7 +336,7 @@ def parser() -> argparse.ArgumentParser:
     history.add_argument("--code", help="Short-lived history import credential")
     history.add_argument("--since", help="Include sessions active on or after YYYY-MM-DD")
     history.add_argument("--dry-run", action="store_true", help="Preview without network access")
-    history.add_argument("--json", action="store_true", help="Print the selected metadata as JSON")
+    history.add_argument("--json", action="store_true", help="Print the selected sessions as JSON")
     history.add_argument("--yes", action="store_true", help="Approve upload without a terminal prompt")
 
     run = commands.add_parser("run", help="Capture one coding session and infer its task")
@@ -414,6 +423,38 @@ def parser() -> argparse.ArgumentParser:
     )
     record.add_argument("--json", action="store_true", help="Print the raw result JSON")
     _repo_option(record)
+
+    next_steps = commands.add_parser(
+        "next", help="Show what to change next in your agent workflow (needs JOYRIDE_API_TOKEN)"
+    )
+    next_steps.add_argument(
+        "--repo", dest="next_repository", metavar="OWNER/NAME",
+        help="Only the suggestions for this GitHub repository",
+    )
+    next_output = next_steps.add_mutually_exclusive_group()
+    next_output.add_argument("--json", action="store_true", help="Print the raw next steps JSON")
+    next_output.add_argument(
+        "--hook", action="store_true",
+        help="Print the top change for the session's repository that its agent can act on, for a SessionStart hook; never fails",
+    )
+
+    replay = commands.add_parser(
+        "replay", help="Replay a merged pull request's task on a cheaper model and score it against what merged"
+    )
+    replay.add_argument("--pr", dest="replay_pr", type=int, required=True, metavar="NUMBER",
+                        help="The merged pull request to replay")
+    _repo_option(replay)
+    replay.add_argument("--model", dest="replay_model", required=True, metavar="MODEL", help="The model to replay it on, for example gpt-6-luna")
+    replay.add_argument("--harness", dest="replay_harness", choices=("claude-code", "codex"),
+                        help="The harness to run (default: claude-code for a Claude model, else codex)")
+    replay.add_argument("--effort", dest="replay_effort", metavar="LEVEL", help="The effort level (default: the harness's own)")
+    replay.add_argument("--budget-usd", dest="replay_budget", type=_cost, default=3.0, metavar="DOLLARS",
+                        help="Stop the replay when it has cost this many dollars (default: 3)")
+    replay.add_argument("--force", action="store_true",
+                        help="Replay a pull request of more than 40 files or 3,000 changed lines")
+    replay.add_argument("--control", dest="replay_control", action="store_true",
+                        help="Also replay the model and effort that paid for the pull request, as a control")
+    replay.add_argument("--json", action="store_true", help="Print each replay record as a line of JSON")
 
     demo = commands.add_parser("demo", help="Print a report from an isolated example repository")
     demo.add_argument("--json", action="store_true", help="Print the raw report JSON")
@@ -640,12 +681,14 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(f"History import preview for {envelope['repository']}: {len(sessions)} sessions")
                 for session in sessions:
                     usage = session["usage"]
+                    trace = session.get("trace")
                     _emit(
                         f"  {session['provider']} {session['native_session_id']} "
                         f"{session['started_at'] or '?'} to {session['last_activity_at'] or '?'} "
                         f"branch={session['branch'] or '?'} model={session['model'] or '?'} "
                         f"requests={len(usage)} prompts={session['prompt_count']} "
-                        f"tools={session['tool_call_count']} {session['completeness']}"
+                        f"tools={session['tool_call_count']} events={len(trace['events']) if trace else 0} "
+                        f"{session['completeness']}"
                     )
                     for claim in session["created_commits"]:
                         reason = ("matches recorded edits" if claim["evidence"] == "recorded_edit"
@@ -655,7 +698,8 @@ def main(argv: list[str] | None = None) -> int:
                     _emit("Skipped: " + ", ".join(
                         f"{item['reason']}={item['count']}" for item in envelope["skipped"]
                     ))
-                _emit("Upload contains only the previewed metadata and numeric usage; no session text or paths.")
+                _emit("Upload contains the previewed metadata, numeric usage, and each session's full trace: "
+                      "prompts, replies, tool inputs and outputs, and the paths they name.")
             if args.dry_run or not sessions:
                 return 0
             if not args.hosted_url or not args.code:
@@ -679,6 +723,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{'session' if session_count == 1 else 'sessions'} in {request_count} "
                     f"{'request' if request_count == 1 else 'requests'}."
                 )
+                if result.get("traces_too_large"):
+                    _emit(f"{result['traces_too_large']} traces did not fit in one request and were not sent.")
             return 0
 
         if args.action == "_hook":
@@ -759,13 +805,21 @@ def main(argv: list[str] | None = None) -> int:
             hosted_url = args.hosted_url or os.environ.get("ATTRIBUTION_HOSTED_URL")
             if args.code is not None and not hosted_url:
                 raise ValueError("--code needs --hosted-url or ATTRIBUTION_HOSTED_URL.")
+            if args.advice is not None and not args.user:
+                raise ValueError("--advice and --no-advice need --user, because the advice hook is a machine hook.")
             if args.user:
                 from .terminal import render_user_setup
                 from .user_install import install_user_hooks, running_agent_sessions
 
-                status = install_user_hooks(usage_fallback=not args.no_usage_fallback)
+                status = install_user_hooks(usage_fallback=not args.no_usage_fallback, advice=args.advice)
                 status["restart_sessions"] = running_agent_sessions()
                 _emit(render_user_setup(status, installed=True))
+                if args.advice is not None:
+                    _emit(
+                        "Session advice: on. Each new session starts with Joyride's top suggestion for its "
+                        "repository while JOYRIDE_API_TOKEN is set where the agent starts."
+                        if args.advice else "Session advice: off."
+                    )
                 _report_install(hosted_url, args.code)
                 return 0
             from .install import install_repo
@@ -1179,6 +1233,18 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(_hosted_result_message(result))
             return 0
 
+        if args.action == "next":
+            from .next_command import run as run_next
+
+            return run_next(args.next_repository, as_json=args.json, hook=args.hook)
+
+        if args.action == "replay":
+            from .replay_command import run as run_replay
+
+            return run_replay(args.replay_pr, repo=_selected_repo(args), model=args.replay_model,
+                              harness=args.replay_harness, effort=args.replay_effort, budget_usd=args.replay_budget,
+                              force=args.force, as_json=args.json, control=args.replay_control)
+
         if args.action == "demo":
             from .demo import create_demo
             from .report import build_dashboard
@@ -1284,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
         # generated invocations intentionally produce no output.
         if args.action in {"_hook", "_git-hook", "_share", "_repair-hooks"} or (
             args.action == "hook" and getattr(args, "observer", False)
-        ):
+        ) or (args.action == "next" and args.hook):
             return 0
         message = getattr(exc, "stderr", None) or str(exc)
         if isinstance(message, bytes):

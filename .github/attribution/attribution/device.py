@@ -2,7 +2,7 @@
 
 The credential lives in the telemetry state directory. A test that points
 ``ATTRIBUTION_TELEMETRY_DIR`` at a temporary folder never touches a real one.
-Only the token travels, in the Authorization header. Session text never does.
+The token travels only in the Authorization header.
 """
 
 from __future__ import annotations
@@ -144,7 +144,9 @@ class DeviceClient:
         request = Request(
             self.origin + path, data=data, method="POST",
             headers={"Authorization": "Bearer " + self._token, "Accept": "application/json",
-                     "Content-Type": "application/json"},
+                     "Content-Type": "application/json",
+                     # A proxy may refuse the default Python-urllib agent.
+                     "User-Agent": f"joyride/{__version__}"},
         )
         try:
             with self._opener.open(request, timeout=_TIMEOUT_SECONDS) as response:

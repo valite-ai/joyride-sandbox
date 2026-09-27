@@ -1342,7 +1342,10 @@ def _handle_post(
                         harness, event, tool_class=tool_class,
                         tool_response=payload.get("tool_response"),
                     ),
-                    "output": payload.get("tool_response"),
+                    # Claude's failure event carries its error text at the top
+                    # level, not in a tool_response. Keep it, so a trace can quote it.
+                    "output": payload.get("tool_response") if payload.get("tool_response") is not None
+                    else ({"error": payload["error"]} if isinstance(payload.get("error"), str) else None),
                 },
                 occurred_at=occurred_at, tool_use_id=tool_use_id,
                 agent_id=_optional_text(payload, "agent_id"),

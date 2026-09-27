@@ -134,6 +134,49 @@ def _managed_command(harness: str) -> str:
     return f"{shlex.quote(str(launcher_path()))} _hook --harness {harness} {_MARKER}"
 
 
+# The opt-in advice hook prints Joyride's top suggestion for the session's
+# repository into the context of each new session. It changes no model,
+# effort, or setting. Its own marker keeps it apart from the capture hooks,
+# so an install without --advice or --no-advice leaves it as it is.
+_ADVICE_MARKER = "# joyride-advice-v1"
+
+
+def _advice_command() -> str:
+    return f"{shlex.quote(str(launcher_path()))} next --hook {_ADVICE_MARKER}"
+
+
+def _with_advice(payload: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    """Return ``payload`` with the advice hook on SessionStart added or removed."""
+
+    hooks = dict(payload.get("hooks") or {})
+    groups: list[Any] = []
+    for group in hooks.get("SessionStart") or []:
+        handlers = group.get("hooks") if isinstance(group, dict) else None
+        if isinstance(handlers, list):
+            kept = [
+                handler for handler in handlers
+                if not (isinstance(handler, dict) and _ADVICE_MARKER in str(handler.get("command")))
+            ]
+            if len(kept) < len(handlers) and not kept and set(group) <= {"matcher", "hooks"}:
+                continue
+            group = {**group, "hooks": kept}
+        groups.append(group)
+    if enabled:
+        # A new or cleared conversation gets the advice; a resumed or compacted one keeps its context.
+        groups.append({
+            "matcher": "startup|clear",
+            "hooks": [{"type": "command", "command": _advice_command(), "timeout": 10}],
+        })
+    if groups:
+        hooks["SessionStart"] = groups
+    else:
+        hooks.pop("SessionStart", None)
+    result = {**payload, "hooks": hooks}
+    if not hooks:
+        del result["hooks"]
+    return result
+
+
 def _stable_executable(runtime: RuntimeCommand) -> Path:
     """Prefer a tool environment's own interpreter link over its target.
 
@@ -368,7 +411,10 @@ def _codex_trust(
         if "created_file" in previous
         else not config_path.exists()
     )
-    entries = trust_entries(hooks_path, payload, _managed_command("codex"))
+    entries = {
+        **trust_entries(hooks_path, payload, _managed_command("codex")),
+        **trust_entries(hooks_path, payload, _advice_command()),
+    }
     owned, message = apply_trust(config_path, hooks_path, entries, _trust_owned(previous))
     record: dict[str, Any] = {
         "config_path": str(config_path),
@@ -410,11 +456,12 @@ def _codex_warning(codex: Any) -> str | None:
 
 
 @_serialized
-def install_user_hooks(*, usage_fallback: bool = True) -> dict[str, Any]:
+def install_user_hooks(*, usage_fallback: bool = True, advice: bool | None = None) -> dict[str, Any]:
     """Write the harness hooks once for this machine and every repository.
 
     ``usage_fallback`` false stops every clone under these hooks from reading
-    usage out of session files when telemetry is missing.
+    usage out of session files when telemetry is missing. ``advice`` true adds
+    the advice hook, false removes it, and None leaves it as it is.
     """
 
     runtime = _runtime()
@@ -444,6 +491,8 @@ def install_user_hooks(*, usage_fallback: bool = True) -> dict[str, Any]:
             )
         # Merging here rejects an invalid hook structure before any change.
         merged = _merge_native_hooks(payload, command, _EVENTS[harness])
+        if advice is not None:
+            merged = _with_advice(merged, advice)
         loaded[harness] = (merged, raw, mode)
 
     # Start the collector only after both configuration files merged.
@@ -624,6 +673,8 @@ def uninstall_user_hooks() -> dict[str, Any]:
         )
         if removed == 0:
             warnings.append(f"Managed hook entries were already absent from {path}.")
+        # The advice hook names the launcher that the uninstall removes.
+        updated = _with_advice(updated, False)
         if harness == "claude-code":
             updated = _remove_claude_telemetry_env(updated, record)
         if created_file and not updated:

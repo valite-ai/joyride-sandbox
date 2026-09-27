@@ -531,6 +531,108 @@ def price_event(provider: Any, event: Mapping[str, Any]) -> Price:
     return _unpriced("unknown_model", normalize_model(event.get("model")) or name or None)
 
 
+# A catalog model's family and tier are the parts of its name around its
+# version: claude-opus-5-5 is Claude Opus at 5.5, and gpt-6-sol is GPT Sol at 6.
+_TIERED = re.compile(
+    r"^(?:(?P<claude>claude)-(?P<claude_tier>[a-z]+)-(?P<claude_version>\d+(?:-\d+)?)"
+    r"|(?P<gpt>gpt)-(?P<gpt_version>\d+(?:\.\d+)?)-(?P<gpt_tier>[a-z]+))$"
+)
+# "Claude 4.7 and later models use a newer tokenizer that produces approximately
+# 30% more tokens for the same text" (Anthropic pricing page, read 2026-09-26).
+CLAUDE_TOKENIZER_VERSION = (4, 7)
+CLAUDE_TOKENIZER_FACTOR = Decimal("1.3")
+_SUCCESSOR_FIELDS = ("input", "output", "cache_read", "cache_write")
+
+
+def _tiered(name: str) -> tuple[str, str, tuple[int, ...]] | None:
+    """A catalog name's family, tier, and version; a dated snapshot has its base's."""
+
+    dated = _DATE_SUFFIX.match(name)
+    match = _TIERED.match(dated.group("base") if dated else name)
+    if match is None:
+        return None
+    if match.group("claude"):
+        return "claude", match.group("claude_tier"), tuple(int(part) for part in match.group("claude_version").split("-"))
+    return "gpt", match.group("gpt_tier"), tuple(int(part) for part in match.group("gpt_version").split("."))
+
+
+def token_factor(model: Any, successor: Any) -> Decimal:
+    """The tokens that ``successor`` counts for each token of ``model`` on the same text.
+
+    A move from a Claude model before 4.7 to one at 4.7 or later counts 1.3
+    times the tokens; any other move counts the same.
+    """
+
+    old, new = (_tiered(normalize_model(name) or "") for name in (model, successor))
+    if old and new and old[0] == new[0] == "claude" and old[2] < CLAUDE_TOKENIZER_VERSION <= new[2]:
+        return CLAUDE_TOKENIZER_FACTOR
+    return Decimal(1)
+
+
+def successor(model: Any) -> str | None:
+    """The catalog model that replaces ``model`` at a lower price, or None.
+
+    It is the newest snapshot model of the same family and tier, such as
+    Claude Opus or GPT Sol, at a higher version, whose every price that both
+    entries list, times ``token_factor``, is at most that of ``model`` and
+    one of them lower. The snapshot carries no release dates, so versions
+    order the models. When the snapshot lacks ``model`` or such a model, the
+    answer is None.
+    """
+
+    entries = {key: entry for models in model_prices.MODELS.values() for key, entry in models.items()}
+    name = normalize_model(model)
+    matched = _match(name, set(entries)) if name else None
+    current = _tiered(matched) if matched else None
+    if current is None:
+        return None
+    best: tuple[tuple[int, ...], str] | None = None
+    for key, entry in entries.items():
+        tiered = _tiered(key)
+        if tiered is None or _DATE_SUFFIX.match(key) or tiered[:2] != current[:2] or tiered[2] <= current[2]:
+            continue
+        factor = token_factor(matched, key)
+        prices = [(Decimal(str(entry[field])) * factor, Decimal(str(entries[matched][field])))
+                  for field in _SUCCESSOR_FIELDS if field in entry and field in entries[matched]]
+        if all(new <= old for new, old in prices) and any(new < old for new, old in prices):
+            if best is None or tiered[2] > best[0]:
+                best = (tiered[2], key)
+    return best[1] if best else None
+
+
+def tier_below(model: Any) -> str | None:
+    """The catalog model one price tier below ``model`` in its family, or None.
+
+    It is the other tier of the family, such as Claude Sonnet below Claude
+    Opus, whose output price is the highest one under that of ``model``. A
+    Claude tier numbers its own versions, so it counts at its newest undated
+    snapshot model. A GPT name leads with its generation, which every tier of
+    that generation shares, so a GPT tier counts at the model's own
+    generation: gpt-6-sol is below gpt-6-astra, and nothing is below
+    gpt-6-luna. A Codex alias counts as the model it names. Without a price or
+    a cheaper tier, the answer is None.
+    """
+
+    entries = {key: entry for models in model_prices.MODELS.values() for key, entry in models.items()}
+    name = normalize_model(model)
+    matched = _match(OPENAI_ALIASES.get(name, name), set(entries)) if name else None
+    current = _tiered(matched) if matched else None
+    own = _decimal(entries[matched].get("output")) if current else None
+    if current is None or own is None:
+        return None
+    tiers: dict[str, tuple[tuple[int, ...], str]] = {}
+    for key in entries:
+        tiered = _tiered(key)
+        if (tiered is None or _DATE_SUFFIX.match(key) or tiered[0] != current[0] or tiered[1] == current[1]
+                or (current[0] == "gpt" and tiered[2] != current[2])):
+            continue
+        if tiered[1] not in tiers or tiered[2] > tiers[tiered[1]][0]:
+            tiers[tiered[1]] = (tiered[2], key)
+    cheaper = [(price, version, key) for version, key in tiers.values()
+               if (price := _decimal(entries[key].get("output"))) is not None and price < own]
+    return max(cheaper)[2] if cheaper else None
+
+
 __all__ = [
     "API_KEY_AUTH_MODES",
     "CHATGPT_AUTH_MODES",
@@ -548,4 +650,7 @@ __all__ = [
     "price_codex_request",
     "price_event",
     "price_openai_api",
+    "successor",
+    "tier_below",
+    "token_factor",
 ]

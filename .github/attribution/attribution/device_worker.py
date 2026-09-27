@@ -2,8 +2,9 @@
 
 The collector runs the poll thread. Each job runs in a child process, so the
 hook path of the collector never waits on Git reads or transcript parsing.
-The child reads local history, uploads the allowlisted metadata, and reports
-fixed error codes. No local path, session text, or token leaves this module.
+The child reads local history, uploads each session with its full trace, and
+reports fixed error codes. Session text and local paths leave only in those
+traces: a progress or error report never carries them, nor the token.
 """
 
 from __future__ import annotations

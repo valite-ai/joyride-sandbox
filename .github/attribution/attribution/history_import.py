@@ -1,7 +1,9 @@
-"""Local, reviewable import of coding-session metadata.
+"""Local, reviewable import of past coding sessions.
 
-Only the allowlisted fields assembled here can cross the network. Session text,
-file locations, and Git remote URLs are read locally and then discarded.
+Each session uploads its metadata, its usage, and its full trace with its
+facts (``history_traces``): every prompt, reply, tool call with its input, and
+tool result with its output, with the paths the session wrote. The Git remote
+URL is read locally and never uploaded.
 """
 
 from __future__ import annotations
@@ -22,13 +24,18 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from . import __version__, history_traces
 from .hosted import _remote_identity
 from .usage_fallback import MAX_LINE_BYTES, parse_claude_lines, parse_codex_lines, price_row
 
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_FILES = 5000
 MAX_DIRS = 10000
+# One fragment of a session's usage rows and commit claims.
 MAX_UPLOAD_BYTES = 512 * 1024
+# The service refuses a request body over 3 MiB. A session's trace goes whole
+# in one request, so a trace that does not fit there is not sent.
+MAX_REQUEST_BYTES = 3 * 1024 * 1024
 # Commit claims in one import. Each one costs the service a GitHub lookup.
 MAX_COMMIT_CLAIMS = 200
 _ID = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,199}$")
@@ -543,6 +550,10 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
              progress: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
     """Find the sessions of one checkout.
 
+    Each selected session carries its ``trace`` and ``facts`` from
+    ``history_traces``; both are None for a session that only a provider's
+    catalog lists, and the trace is None for a session without events.
+
     ``progress`` receives the scan step, the files read so far, and the file
     total: ``catalog`` while a provider's own interface lists sessions, and
     ``files`` for each native file. A page can show a bar from these.
@@ -569,6 +580,8 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
     official: dict[tuple[str, str], dict[str, Any]] = {}
     official_paths: dict[tuple[str, str], set[Path]] = {}
     session_files: Counter[tuple[str, str]] = Counter()
+    # The trace and facts of each session, read from the same records.
+    builders: dict[tuple[str, str], history_traces.Session] = {}
     provider_locations = (("claude", default_claude if claude_roots is None else claude_roots),
                           ("codex", default_codex if codex_roots is None else codex_roots))
     # The file count comes first, so the scan can report a fraction.
@@ -652,6 +665,16 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
                     skipped["mixed_repository"] += 1
                     continue
                 session_files[key] += 1
+                builder = builders.get(key)
+                if builder is None:
+                    builder = builders[key] = history_traces.Session(
+                        "claude-code" if provider == "claude" else "codex", native,
+                        parent if isinstance(parent, str) and _ID.fullmatch(parent) else None,
+                    )
+                if provider == "claude":
+                    builder.read_claude(batch_records)
+                else:
+                    builder.read_codex(batch_records, batch_lines)
                 native_model, native_model_stamp = _native_model(batch_records, provider)
                 if provider == "claude":
                     latest_first = [raw for _record, raw in sorted(
@@ -789,6 +812,8 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
                     tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             session["usage"].append(item)
         session["usage"].sort(key=lambda row: (row.get("observed_at", ""), row["event_key"]))
+        # A session that only a provider's catalog lists has no records to read.
+        session["trace"], session["facts"] = builders[key].finish() if key in builders else (None, None)
         selected.append(session)
     selected.sort(key=lambda session: (session["started_at"], session["provider"], session["native_session_id"]))
     # Each claim costs one GitHub lookup. The newest sessions keep their
@@ -831,7 +856,9 @@ def upload(envelope: dict[str, Any], hosted_url: str, code: str) -> dict[str, in
     def post(data: bytes) -> dict[str, Any]:
         request = Request(origin + "/v1/history/sessions", data=data, method="POST",
                           headers={"Authorization": "Bearer " + code,
-                                   "Content-Type": "application/json"})
+                                   "Content-Type": "application/json",
+                                   # A proxy may refuse the default Python-urllib agent.
+                                   "User-Agent": f"joyride/{__version__}"})
         with opener.open(request, timeout=20) as response:
             raw = response.read(65537)
             if len(raw) > 65536:
@@ -852,6 +879,10 @@ def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]
     service error (HTTP 429, 500, 502, 503, or 504) or a network error is
     retried up to two times. ``on_request`` receives each answer with the
     count of requests sent so far and the total.
+
+    A session's trace and facts travel once, on its final fragment. A trace
+    that cannot fit in one request goes as null, and the last request counts
+    it under the skipped reason ``trace_too_large``.
     """
 
     sessions = envelope["sessions"]
@@ -860,19 +891,29 @@ def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]
     chunk: list[dict[str, Any]] = []
     claims = 0
     fragments: list[dict[str, Any]] = []
+    too_large = 0
+
+    def encoded(value: Any) -> bytes:
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    # Sizes assume the longest skipped list the last request can carry.
+    sizing = {**envelope, "skipped": [*envelope["skipped"], {"reason": "trace_too_large", "count": len(sessions)}]}
+
     def payload_size(batch: list[dict[str, Any]]) -> int:
-        return len(json.dumps({**envelope, "sessions": batch}, separators=(",", ":")).encode("utf-8"))
+        return len(encoded({**sizing, "sessions": batch}))
 
     for session in sessions:
-        usage = session["usage"]
-        commit_rows = session["created_commits"]
+        carried = {key: session[key] for key in ("trace", "facts") if key in session}
+        base = {key: value for key, value in session.items() if key not in carried}
+        usage = base["usage"]
+        commit_rows = base["created_commits"]
         start = commit_start = 0
         while True:
             width = min(1000, len(usage) - start)
             commit_batch = commit_rows[commit_start:commit_start + 3]
             while True:
                 final = start + width == len(usage) and commit_start + len(commit_batch) == len(commit_rows)
-                fragment = {**session, "usage": usage[start:start + width],
+                fragment = {**base, "usage": usage[start:start + width],
                             "created_commits": commit_batch}
                 if not final:
                     fragment["completeness"] = "partial"
@@ -886,30 +927,38 @@ def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]
             commit_start += len(commit_batch)
             if final:
                 break
+        if carried:
+            fragment = {**fragments[-1], **carried}
+            if fragment.get("trace") is not None and payload_size([fragment]) > MAX_REQUEST_BYTES:
+                fragment["trace"] = None
+                too_large += 1
+            fragments[-1] = fragment
+    skipped = [*envelope["skipped"], *([{"reason": "trace_too_large", "count": too_large}] if too_large else [])]
+    # A request is the envelope and its fragments, each measured once, joined by commas.
+    empty = size = payload_size([])
     for fragment in fragments:
-        candidate = chunk + [fragment]
+        width = len(encoded(fragment)) + 1
         candidate_claims = claims + len(fragment["created_commits"])
-        size = payload_size(candidate)
-        if chunk and (len(candidate) > 100 or candidate_claims > 3 or
-                      sum(len(item["usage"]) for item in candidate) > 2000 or
-                      size > MAX_UPLOAD_BYTES):
+        if chunk and (len(chunk) >= 100 or candidate_claims > 3 or
+                      sum(len(item["usage"]) for item in chunk) + len(fragment["usage"]) > 2000 or
+                      size + width > MAX_REQUEST_BYTES):
             chunks.append(chunk)
-            chunk = [fragment]
-            claims = len(fragment["created_commits"])
-            if claims > 3 or payload_size(chunk) > MAX_UPLOAD_BYTES:
+            chunk, size, claims = [fragment], empty + width, len(fragment["created_commits"])
+            if claims > 3 or size > MAX_REQUEST_BYTES:
                 raise ValueError("one session fragment exceeds the upload limit")
-        elif size > MAX_UPLOAD_BYTES or candidate_claims > 3:
+        elif size + width > MAX_REQUEST_BYTES or candidate_claims > 3:
             raise ValueError("one session fragment exceeds the upload limit")
         else:
-            chunk = candidate
+            chunk.append(fragment)
+            size += width
             claims = candidate_claims
     if chunk:
         chunks.append(chunk)
     for index, batch in enumerate(chunks):
         payload = {**envelope, "sessions": batch,
                    "complete": index == len(chunks) - 1,
-                   "skipped": envelope["skipped"] if index == len(chunks) - 1 else []}
-        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                   "skipped": skipped if index == len(chunks) - 1 else []}
+        data = encoded(payload)
         for attempt in range(3):
             try:
                 answer = post(data)
@@ -927,4 +976,5 @@ def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]
             time.sleep(0.5 * (attempt + 1))
         if on_request is not None:
             on_request(answer, index + 1, len(chunks))
-    return {**results, "selected_sessions": len(sessions), "request_count": len(chunks)}
+    return {**results, "selected_sessions": len(sessions), "request_count": len(chunks),
+            "traces_too_large": too_large}
