@@ -461,8 +461,10 @@ def parser() -> argparse.ArgumentParser:
 
     # Private commands are deliberately absent from the public help listing.
     # Both global and suffix --repo forms remain compatible with installed hooks.
+    from .hook_client import HARNESSES
+
     native = commands.add_parser("_hook", add_help=False)
-    native.add_argument("--harness", required=True, choices=("codex", "claude-code"))
+    native.add_argument("--harness", required=True, choices=HARNESSES)
     native.add_argument("--repo", dest="hook_repo", type=Path)
     native.add_argument("--repository-hook", action="store_true")
     git_hook = commands.add_parser("_git-hook", add_help=False)

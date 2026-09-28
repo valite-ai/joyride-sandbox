@@ -90,6 +90,68 @@ _TOOL_CLASS_BY_NAME = {
     "AskUserQuestion": "ask_user",
 }
 
+# Harnesses whose tool names differ from Claude Code's keep their own table, so
+# a common word such as ``write`` classifies a tool only for the harness that
+# documents it. GitHub Copilot reports Claude's names and uses the shared table.
+# Sources: Cursor, https://cursor.com/docs/hooks; Gemini CLI,
+# https://geminicli.com/docs/reference/tools/; OpenCode,
+# https://opencode.ai/docs/tools/; Hermes Agent,
+# https://hermes-agent.nousresearch.com/docs/reference/tools-reference.
+_NATIVE_TOOL_CLASSES = {
+    "cursor": {
+        "Shell": "shell",
+        "Read": "read",
+        "Write": "write",
+        "Delete": "write",
+        "Grep": "search",
+        "Task": "agent",
+        "WebFetch": "web",
+        "WebSearch": "web",
+    },
+    "gemini": {
+        "write_file": "write",
+        "replace": "edit",
+        "run_shell_command": "shell",
+        "read_file": "read",
+        "read_many_files": "read",
+        "list_directory": "search",
+        "glob": "search",
+        "grep_search": "search",
+        "search_file_content": "search",
+        "web_fetch": "web",
+        "google_web_search": "web",
+        "invoke_agent": "agent",
+    },
+    "opencode": {
+        "write": "write",
+        "edit": "edit",
+        "apply_patch": "edit",
+        "bash": "shell",
+        "read": "read",
+        "grep": "search",
+        "glob": "search",
+        "webfetch": "web",
+        "websearch": "web",
+        "task": "agent",
+        "skill": "skill",
+        "question": "ask_user",
+    },
+    "hermes": {
+        "write_file": "write",
+        "patch": "edit",
+        "terminal": "shell",
+        # execute_code runs Python that can change any file.
+        "execute_code": "shell",
+        "read_file": "read",
+        "search_files": "search",
+        "web_search": "web",
+        "web_extract": "web",
+        "delegate_task": "agent",
+    },
+}
+# MCP tool names in each harness's own form.
+_NATIVE_MCP_PREFIXES = {"cursor": "MCP:", "gemini": "mcp_"}
+
 # The installer subscribes its pre-tool hook to exactly these names, so a tool
 # never reaches the receiver for a snapshot it does not need. A tool that
 # changes files under a name the class table does not hold is named here rather
@@ -107,9 +169,14 @@ SNAPSHOT_TOOL_NAMES = frozenset(
 # A harness says that a tool call failed by sending its own failure event.
 # These are the harnesses whose hooks this project subscribes to one: ``_EVENTS``
 # in ``install.py`` and ``_NESTED_EVENTS`` and ``_COPILOT_EVENTS`` in
-# ``hook_templates.py``. Anywhere else a completion event fires for a failed
-# call too, so completion alone proves nothing about the outcome.
-FAILURE_EVENT_HARNESSES = frozenset({"claude-code", "github-copilot", "qwen-code"})
+# ``hook_templates.py``. Cursor and Gemini CLI report a failure on its own
+# event or in the response, OpenCode runs its post-tool hook only after a
+# call that succeeded, and Hermes Agent states each call's status. Anywhere
+# else a completion event fires for a failed call too, so completion alone
+# proves nothing about the outcome.
+FAILURE_EVENT_HARNESSES = frozenset(
+    {"claude-code", "cursor", "gemini", "github-copilot", "hermes", "opencode", "qwen-code"}
+)
 # ``response_success`` reads a plain-string response only for a patch or a
 # shell command, so only those classes name the shape it knows.
 _RESPONSE_KINDS = {"edit": "patch", "write": "patch", "shell": "shell"}
@@ -259,12 +326,15 @@ def classify_tool(harness_id: str, tool_name: Any) -> str:
     ``WriteReport`` is never counted as a file write.
     """
 
-    del harness_id  # Tool names are harness-wide; only their payloads differ.
     name = _text(tool_name, max_chars=512)
     if name is None:
         return "other"
-    if name.startswith("mcp__"):
+    if name.startswith("mcp__") or name.startswith(
+        _NATIVE_MCP_PREFIXES.get(harness_id, "mcp__")
+    ):
         return "mcp"
+    if harness_id in _NATIVE_TOOL_CLASSES:
+        return _NATIVE_TOOL_CLASSES[harness_id].get(name, "other")
     return _TOOL_CLASS_BY_NAME.get(name, "other")
 
 
@@ -276,8 +346,24 @@ def takes_snapshot(harness_id: str, tool_name: Any) -> bool:
     or a subagent launch to one small database write.
     """
 
-    del harness_id  # Tool names are harness-wide; only their payloads differ.
+    if harness_id in _NATIVE_TOOL_CLASSES:
+        return classify_tool(harness_id, tool_name) in SNAPSHOT_TOOL_CLASSES
     return _text(tool_name, max_chars=512) in SNAPSHOT_TOOL_NAMES
+
+
+def input_path(tool_input: Any) -> Any:
+    """Return the file path a tool's input names, under any harness's key.
+
+    Claude Code and Gemini CLI name it ``file_path``, OpenCode ``filePath``,
+    and GitHub Copilot CLI and Hermes Agent ``path``.
+    """
+
+    if not isinstance(tool_input, Mapping):
+        return None
+    for key in ("file_path", "filePath", "path"):
+        if tool_input.get(key) is not None:
+            return tool_input[key]
+    return None
 
 
 def _has_secret_prefix(value: str) -> bool:
@@ -376,7 +462,7 @@ def extract_locator(
     if tool_class in {"read", "write"} or (
         tool_class == "edit" and name != "apply_patch"
     ):
-        return path_locator(tool_input.get("file_path"), repo_root)
+        return path_locator(input_path(tool_input), repo_root)
 
     if tool_class == "edit":
         # Codex applies one patch across several files, so no single path

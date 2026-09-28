@@ -44,6 +44,8 @@ from .install import (
     _remove_native_hooks,
     _runtime,
 )
+from . import install_harnesses
+from .harnesses import harness_display_name
 from .codex_trust import apply_trust, remove_trust, trust_entries
 from .global_git_hooks import (
     git_hooks_health,
@@ -67,7 +69,16 @@ _TRUST_FAILURE = (
 )
 # Process names that identify a coding session. A Node launcher reports the
 # script as its second argument, so both positions are read.
-_AGENT_COMMANDS = {"claude": "Claude Code", "codex": "Codex", "codex.js": "Codex"}
+_AGENT_COMMANDS = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "codex.js": "Codex",
+    "copilot": "GitHub Copilot",
+    "cursor-agent": "Cursor",
+    "gemini": "Gemini CLI",
+    "hermes": "Hermes Agent",
+    "opencode": "OpenCode",
+}
 _NODE_COMMANDS = {"node", "nodejs"}
 
 
@@ -533,6 +544,22 @@ def install_user_hooks(*, usage_fallback: bool = True, advice: bool | None = Non
             if codex_warning:
                 warnings.append(codex_warning)
 
+    # The other harnesses get hooks only when they are installed here, or when
+    # an earlier install gave them hooks that this one keeps current.
+    extra: dict[str, dict[str, Any]] = {}
+    for harness in install_harnesses.HARNESSES:
+        record = _record(previous, harness)
+        if record is None and not install_harnesses.detected(harness, home, os.environ):
+            continue
+        try:
+            extra[harness] = install_harnesses.plan(harness, home, launcher, record, os.environ)
+        except (OSError, ValueError) as exc:
+            warnings.append(
+                f"{harness_display_name(harness)} hooks could not be installed: {exc}"
+            )
+            if record is not None:
+                extra[harness] = record
+
     launcher_bytes = _launcher_bytes(runtime, executable)
     manifest: dict[str, Any] = {
         "version": _VERSION,
@@ -600,6 +627,7 @@ def install_user_hooks(*, usage_fallback: bool = True, advice: bool | None = Non
         manifest["integrations"][harness] = entry
         if raw != desired or (raw is not None and mode != desired_mode):
             prepared.append((path, desired, desired_mode))
+    manifest["integrations"].update(extra)
     # Record ownership before the hooks exist so that an interrupted install
     # still leaves an uninstall that can remove every command it wrote. The
     # launcher comes next, so a hook never names a missing launcher.
@@ -607,6 +635,13 @@ def install_user_hooks(*, usage_fallback: bool = True, advice: bool | None = Non
     _write(launcher, launcher_bytes, mode=0o755)
     for path, desired, mode in prepared:
         _write(path, desired, mode=mode)
+    for harness, record in extra.items():
+        try:
+            warnings.extend(install_harnesses.apply(harness, record, home, launcher, os.environ))
+        except (OSError, ValueError) as exc:
+            warnings.append(
+                f"{harness_display_name(harness)} hooks could not be installed: {exc}"
+            )
     # Codex trust is written without a notice, by the product decision to
     # remove the /hooks review step. Uninstall removes it again.
     manifest["codex_trust"] = _codex_trust(manifest.get("codex_trust"), written["codex"])
@@ -681,6 +716,16 @@ def uninstall_user_hooks() -> dict[str, Any]:
             path.unlink()
         elif updated != payload:
             _write(path, _json_bytes(updated), mode=mode)
+    for harness in install_harnesses.HARNESSES:
+        record = _record(manifest, harness)
+        if record is None:
+            continue
+        try:
+            warnings.extend(install_harnesses.uninstall(harness, record, _home(), os.environ))
+        except (OSError, ValueError) as exc:
+            warnings.append(
+                f"{harness_display_name(harness)} hooks could not be removed: {exc}"
+            )
     telemetry_pending = False
     if (
         manifest.get("telemetry_registered") is True
@@ -857,8 +902,23 @@ def user_install_status() -> dict[str, Any]:
         manifest = load_user_manifest()
     except (OSError, ValueError):
         manifest = None
+    # Claude Code and Codex decide whether the machine install is healthy.
+    # Another harness reports its own state beside them.
+    installed = all(item["installed"] for item in harnesses.values())
+    for harness in install_harnesses.HARNESSES:
+        record = _record(manifest, harness)
+        if record is not None:
+            harnesses[harness] = install_harnesses.health(harness, record)
+        elif install_harnesses.detected(harness, _home(), os.environ):
+            harnesses[harness] = {
+                "installed": False,
+                "state": "not-installed",
+                "message": "Run joyride install --user to add its hooks.",
+            }
+        else:
+            harnesses[harness] = {"installed": False, "state": "not-detected", "message": None}
     status: dict[str, Any] = {
-        "installed": all(item["installed"] for item in harnesses.values()),
+        "installed": installed,
         "scope": "user",
         "manifest_path": str(user_manifest_path()),
         "harnesses": harnesses,
@@ -913,7 +973,7 @@ def repair_user_hooks() -> dict[str, Any]:
 
 
 def running_agent_sessions(listing: str | None = None) -> list[dict[str, Any]]:
-    """Name the Claude Code and Codex processes that must restart to load hooks.
+    """Name the coding agent processes that must restart to load hooks.
 
     ``listing`` is ``ps -Ao pid=,ppid=,args=`` output. A child of a process
     that already counts, such as a native binary behind its Node launcher, is

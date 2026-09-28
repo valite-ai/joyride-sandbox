@@ -85,7 +85,10 @@ _NESTED_EVENTS: dict[str, tuple[str, ...]] = {
 # PascalCase selects Copilot's VS Code-compatible payload. The generated command
 # also supplies the event name so the receiver does not depend on that payload
 # detail. Copilot's SubagentStart payload has no stable agent id, so starting a
-# child attribution unit there would not pair safely with SubagentStop.
+# child attribution unit there would not pair safely with SubagentStop. The
+# command goes in the bash field, which Copilot CLI and the cloud agent both
+# run. The exec and args fields work only in the CLI.
+# https://docs.github.com/en/copilot/reference/hooks-reference
 _COPILOT_EVENTS = (
     "UserPromptSubmit",
     "PostToolUse",
@@ -167,17 +170,7 @@ def _copilot_template(
             event: [
                 {
                     "type": "command",
-                    "exec": attribution_command,
-                    "args": [
-                        "hook",
-                        "--feature",
-                        feature,
-                        "--harness",
-                        "github-copilot",
-                        "--event",
-                        event,
-                        "--observer",
-                    ],
+                    "bash": _command(attribution_command, feature, "github-copilot", event),
                 }
             ]
             for event in _COPILOT_EVENTS

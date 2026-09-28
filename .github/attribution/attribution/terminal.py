@@ -14,7 +14,10 @@ import unicodedata
 from typing import Any
 
 from .cost_reasons import describe, is_proxy_priced
+from .harnesses import HARNESS_SPECS, harness_display_name
 from .workflow import iter_agents
+
+_HARNESS_IDS = frozenset(spec.id for spec in HARNESS_SPECS)
 
 
 _DEFAULT_WIDTH = 88
@@ -1753,6 +1756,7 @@ def _install_state(value: Any) -> str:
     return {
         "enabled": "enabled",
         "not-installed": "not installed",
+        "not-detected": "not found on this computer",
         "needs-attention": "needs attention",
     }.get(value, "unknown")
 
@@ -2037,7 +2041,12 @@ def render_user_setup(
     lines = [_style(heading, _BOLD + heading_color, use_color)]
     _append_field(lines, "Scope", "every repository on this machine", output_width)
     harnesses = _mapping(data.get("harnesses"))
-    for key, label in (("codex", "Codex"), ("claude-code", "Claude Code")):
+    others = [
+        (key, harness_display_name(key))
+        for key in harnesses
+        if key not in {"codex", "claude-code"} and key in _HARNESS_IDS
+    ]
+    for key, label in (("codex", "Codex"), ("claude-code", "Claude Code"), *others):
         harness = _mapping(harnesses.get(key))
         harness_state = _install_state(harness.get("state"))
         message = safe_text(harness.get("message"))

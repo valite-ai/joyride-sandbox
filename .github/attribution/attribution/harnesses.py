@@ -548,6 +548,7 @@ def harness_catalog() -> list[dict[str, object]]:
     """Return a stable, JSON-serializable catalog sorted by canonical id."""
 
     from .adapters import supported_adapters
+    from .hook_client import HARNESSES as machine_hook_ids
     from .hook_templates import supported_template_harnesses
 
     adapter_ids = set(supported_adapters())
@@ -561,6 +562,8 @@ def harness_catalog() -> list[dict[str, object]]:
             "package_names": list(spec.package_names),
             "hook_support": spec.hook_support,
             "hook_template_support": spec.id in template_ids,
+            # joyride install --user gives this harness its hooks when it is installed.
+            "machine_hook_support": spec.id in machine_hook_ids,
             "metadata_adapter_support": spec.id in adapter_ids,
         }
         for spec in sorted(HARNESS_SPECS, key=lambda item: item.id)

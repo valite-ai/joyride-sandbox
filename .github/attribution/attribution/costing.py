@@ -10,6 +10,7 @@ import sqlite3
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
+from .adapters.native_hooks import NATIVE_HARNESSES
 from .pricing import price_event, price_openai_api
 from .usage_fallback import (
     FALLBACK_EVENT_NAME,
@@ -52,6 +53,9 @@ def _model_key(value: Any) -> str | None:
 
 
 def _provider_harness(provider: Any) -> str | None:
+    # Usage that another harness reported names that harness as its provider.
+    if provider in NATIVE_HARNESSES:
+        return provider
     return {"claude": "claude-code", "codex": "codex"}.get(provider)
 
 

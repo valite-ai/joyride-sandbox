@@ -29,7 +29,17 @@ HOOK_INPUT_LIMIT = 2 * 1024 * 1024
 WORKFLOW_PATH = ".github/workflows/attribution-footer.yml"
 STATE_DIR_ENV = "ATTRIBUTION_TELEMETRY_DIR"
 DISABLE_TELEMETRY_ENV = "HARNESS_ATTRIBUTION_DISABLE_TELEMETRY"
-HARNESSES = ("codex", "claude-code")
+# Claude Code and Codex send the receiver's own events. The other harnesses
+# send native events that ``adapters.native_hooks`` translates.
+HARNESSES = (
+    "codex",
+    "claude-code",
+    "cursor",
+    "gemini",
+    "github-copilot",
+    "hermes",
+    "opencode",
+)
 
 # A PreToolUse must finish before the tool runs. The native hook timeout is
 # 10 seconds, so the client stops waiting a little before the tool would.
@@ -49,7 +59,15 @@ _RESPONSE_LIMIT = 64 * 1024
 # under another session's configuration. PATH differs between coding tools
 # without changing what the hook code reads, so it does not split sessions.
 _ENVIRONMENT_NAMES = frozenset(
-    {"HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"}
+    {
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        # The Copilot translation reads the session's selected model there.
+        "COPILOT_HOME",
+    }
 )
 _ENVIRONMENT_PREFIXES = (
     "ATTRIBUTION_",
@@ -229,6 +247,10 @@ def _parse(arguments: list[str]) -> tuple[str, str | None, bool] | None:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
+        if argument.startswith("#"):
+            # A harness that runs the hook command without a shell passes the
+            # managed marker comment as arguments.
+            break
         if argument in {"--harness", "--repo"}:
             if index + 1 >= len(arguments):
                 return None
@@ -507,7 +529,21 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return 0
-        cwd = payload.get("cwd")
+        if harness in {"codex", "claude-code"}:
+            if harness == "claude-code" and "cursor_version" in payload:
+                # Cursor also runs the Claude Code hooks. Its own hooks record
+                # the event, so this copy records nothing.
+                return 0
+            cwd = payload.get("cwd")
+            wait = payload.get("hook_event_name") == "PreToolUse"
+        else:
+            from .adapters.native_hooks import canonical_events
+
+            events = canonical_events(harness, payload)
+            if not events:
+                return 0
+            cwd = next((event["cwd"] for event in events if event.get("cwd")), None)
+            wait = any(event["hook_event_name"] == "PreToolUse" for event in events)
         repo = os.path.abspath(
             selected_repo
             if selected_repo
@@ -524,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
                 "repository_hook": repository_hook,
                 "identity": runtime_identity(),
                 "environment": environment_key(environ),
-                "wait": payload.get("hook_event_name") == "PreToolUse",
+                "wait": wait,
             }
             if deliver(default_state_dir(environ), metadata, raw, started=started):
                 return 0

@@ -14,6 +14,14 @@ import uuid
 import zlib
 
 from . import activity, traces
+from .adapters.native_hooks import (
+    MODEL_EVENT,
+    NATIVE_HARNESSES,
+    TURN_CAPTURE_HARNESSES,
+    TURN_CAPTURE_TOOL,
+    USAGE_EVENT,
+    canonical_events,
+)
 from .capture import (
     _base_commit,
     _content_hash,
@@ -38,7 +46,7 @@ from .store import (
 )
 
 
-SUPPORTED_HARNESSES = frozenset({"codex", "claude-code"})
+SUPPORTED_HARNESSES = frozenset({"codex", "claude-code", *NATIVE_HARNESSES})
 KNOWN_EVENTS = frozenset(
     {
         "SessionStart",
@@ -54,6 +62,8 @@ KNOWN_EVENTS = frozenset(
         "Interrupt",
         "Stop",
         "SessionEnd",
+        MODEL_EVENT,
+        USAGE_EVENT,
     }
 )
 ACTIVE_CAPTURE_STATES = ("pending", "contaminated", "limited", "imported")
@@ -250,7 +260,11 @@ def _session_context(
 
     if direct_model is not None:
         model, model_source = direct_model
-    elif harness == "claude-code" and existing["model_source"] == "session_setting":
+    elif (harness == "claude-code" and existing["model_source"] == "session_setting") or (
+        # These harnesses name the model at a session start, a prompt, or a
+        # model request, and their tool events name none.
+        harness in NATIVE_HARNESSES and existing["model"] != "unknown"
+    ):
         model = existing["model"]
         model_source = existing["model_source"]
     else:
@@ -302,9 +316,16 @@ def _is_agent_call(harness: str, payload: Mapping[str, Any]) -> bool:
 
 
 def _takes_snapshot(harness: str, payload: Mapping[str, Any]) -> bool:
-    """Return whether one tool event needs the worktree snapshot pair."""
+    """Return whether one tool event needs the worktree snapshot pair.
 
-    return activity.takes_snapshot(harness, _optional_text(payload, "tool_name"))
+    A harness that is captured by turn takes its snapshots at the turn's
+    boundaries, so none of its tool calls takes one.
+    """
+
+    tool_name = _optional_text(payload, "tool_name")
+    if tool_name == TURN_CAPTURE_TOOL or harness in TURN_CAPTURE_HARNESSES:
+        return tool_name == TURN_CAPTURE_TOOL
+    return activity.takes_snapshot(harness, tool_name)
 
 
 _PATCH_TARGET_PREFIXES = (
@@ -349,12 +370,23 @@ def _snapshot_targets(repo: Path, harness: str, payload: Mapping[str, Any]) -> l
     if not isinstance(tool_input, Mapping):
         return None
     tool_name = _optional_text(payload, "tool_name")
+    patch: object = None
     if harness == "claude-code" and tool_name in {"Write", "Edit", "MultiEdit"}:
-        values: list[object] = [tool_input.get("file_path")]
+        values: list[object] | None = [tool_input.get("file_path")]
     elif harness == "claude-code" and tool_name == "NotebookEdit":
         values = [tool_input.get("notebook_path")]
     elif harness == "codex" and tool_name in {"apply_patch", "Edit", "Write"}:
-        patch = tool_input.get("command")
+        patch, values = tool_input.get("command"), None
+    elif harness in NATIVE_HARNESSES and _tool_class(harness, payload) in {"edit", "write"}:
+        # OpenCode's apply_patch and Hermes's patch mode name their files
+        # inside the patch text, as Codex's apply_patch does.
+        patch = tool_input.get("patchText") or (
+            tool_input.get("patch") if tool_input.get("mode") == "patch" else None
+        )
+        values = None if patch is not None else [activity.input_path(tool_input)]
+    else:
+        return None
+    if values is None:
         if not isinstance(patch, str):
             return None
         values = [
@@ -365,8 +397,6 @@ def _snapshot_targets(repo: Path, harness: str, payload: Mapping[str, Any]) -> l
         ]
         if not values:
             return None
-    else:
-        return None
     targets: list[str] = []
     for value in values:
         target = _repository_path(value, _optional_text(payload, "cwd"), repo)
@@ -631,6 +661,47 @@ def _capture_identity(
 ) -> str:
     material = "\0".join((worktree_id, harness, native_session_id, tool_use_id))
     return str(uuid.uuid5(uuid.NAMESPACE_URL, material))
+
+
+def _tool_use_id(
+    connection: sqlite3.Connection,
+    worktree_id: str,
+    harness: str,
+    native_session_id: str,
+    payload: Mapping[str, Any],
+    event: str,
+) -> str:
+    """Return the tool id one tool event names, or the one its pairing key gets.
+
+    Gemini CLI and GitHub Copilot CLI give a tool call no id. A pre-tool event
+    gets the next unused id for its pairing key. A post-tool event takes the
+    oldest open capture with its key, then the oldest with its tool name, and
+    a call without an open capture gets an id of its own.
+    """
+
+    key = _optional_text(payload, "pairing_key")
+    if _optional_text(payload, "tool_use_id") is not None or key is None:
+        return _required_text(payload, "tool_use_id")
+
+    def captures(prefix: str) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT tool_use_id, status FROM hook_captures
+            WHERE worktree_id = ? AND harness = ? AND native_session_id = ?
+              AND substr(tool_use_id, 1, ?) = ?
+            ORDER BY rowid
+            """,
+            (worktree_id, harness, native_session_id, len(prefix), prefix),
+        ).fetchall()
+
+    same_key = captures(f"{key}@")
+    if event == "PreToolUse":
+        return f"{key}@{len(same_key)}"
+    for rows in (same_key, captures(key.rpartition(":")[0] + ":")):
+        for row in rows:
+            if row["status"] in ACTIVE_CAPTURE_STATES:
+                return str(row["tool_use_id"])
+    return f"{key}@{uuid.uuid4().hex}"
 
 
 def _tool_session(
@@ -904,8 +975,9 @@ def _handle_fast_pre(
     capture queue, so the subagent's own captures no longer overlap it.
     """
 
-    if not _is_agent_call(harness, payload):
-        # Every other class is recorded from its completion alone.
+    if not _is_agent_call(harness, payload) or _optional_text(payload, "tool_use_id") is None:
+        # Every other class is recorded from its completion alone, and so is
+        # a launch whose harness gives it no id to join the completion to.
         return _result("ignored")
     tool_use_id = _required_text(payload, "tool_use_id")
     worktree_id = str(git_dir(repo))
@@ -939,13 +1011,15 @@ def _handle_pre(
     native_session_id: str,
     deadline: float | None = None,
 ) -> dict[str, object]:
-    tool_use_id = _required_text(payload, "tool_use_id")
     worktree_id = str(git_dir(repo))
-    capture_id = _capture_identity(worktree_id, harness, native_session_id, tool_use_id)
 
     with _worktree_lock(repo, blocking=True):
         connection = open_db(repo)
         try:
+            tool_use_id = _tool_use_id(
+                connection, worktree_id, harness, native_session_id, payload, "PreToolUse"
+            )
+            capture_id = _capture_identity(worktree_id, harness, native_session_id, tool_use_id)
             existing = connection.execute(
                 """
                 SELECT ledger_session_id
@@ -1276,7 +1350,6 @@ def _handle_post(
     native_session_id: str,
     event: str,
 ) -> dict[str, object]:
-    tool_use_id = _required_text(payload, "tool_use_id")
     worktree_id = str(git_dir(repo))
     changed_files: list[str] = []
     warnings: list[str] = []
@@ -1286,6 +1359,9 @@ def _handle_post(
     with _worktree_lock(repo, blocking=True):
         connection = open_db(repo)
         try:
+            tool_use_id = _tool_use_id(
+                connection, worktree_id, harness, native_session_id, payload, event
+            )
             capture = connection.execute(
                 """
                 SELECT *
@@ -1308,60 +1384,63 @@ def _handle_post(
                 # delta to a new session; it does not move the call that
                 # produced it.
                 activity_session_id = str(capture["ledger_session_id"])
-            # The row is written before the Agent branch below, which updates
-            # that row with the child session and the duration the response
-            # reports. An Agent call takes no snapshot, so its completion is
-            # commonly the first event that names it.
-            occurred_at = _utc_now()
-            locator = _record_tool_activity(
-                connection,
-                repo,
-                payload,
-                harness,
-                activity_session_id,
-                tool_use_id,
-                event,
-                occurred_at,
-            )
-            tool_class = _tool_class(harness, payload)
-            _record_trace(
-                connection, repo, activity_session_id, "tool_call",
-                {
-                    "tool_name": _required_text(payload, "tool_name"),
-                    "tool_class": tool_class, "summary": locator,
-                    "input": payload.get("tool_input"),
-                },
-                occurred_at=occurred_at, tool_use_id=tool_use_id,
-                agent_id=_optional_text(payload, "agent_id"),
-                turn_id=_optional_text(payload, "turn_id"),
-            )
-            _record_trace(
-                connection, repo, activity_session_id, "tool_result",
-                {
-                    "succeeded": activity.tool_succeeded(
-                        harness, event, tool_class=tool_class,
-                        tool_response=payload.get("tool_response"),
-                    ),
-                    # Claude's failure event carries its error text at the top
-                    # level, not in a tool_response. Keep it, so a trace can quote it.
-                    "output": payload.get("tool_response") if payload.get("tool_response") is not None
-                    else ({"error": payload["error"]} if isinstance(payload.get("error"), str) else None),
-                },
-                occurred_at=occurred_at, tool_use_id=tool_use_id,
-                agent_id=_optional_text(payload, "agent_id"),
-                turn_id=_optional_text(payload, "turn_id"),
-            )
-            if _is_agent_call(harness, payload):
-                _record_finished_agent_call(
+            # A turn capture is not a tool call, so it records only the
+            # files its turn changed.
+            if _optional_text(payload, "tool_name") != TURN_CAPTURE_TOOL:
+                # The row is written before the Agent branch below, which updates
+                # that row with the child session and the duration the response
+                # reports. An Agent call takes no snapshot, so its completion is
+                # commonly the first event that names it.
+                occurred_at = _utc_now()
+                locator = _record_tool_activity(
                     connection,
                     repo,
                     payload,
                     harness,
-                    worktree_id,
-                    native_session_id,
+                    activity_session_id,
                     tool_use_id,
-                    capture,
+                    event,
+                    occurred_at,
                 )
+                tool_class = _tool_class(harness, payload)
+                _record_trace(
+                    connection, repo, activity_session_id, "tool_call",
+                    {
+                        "tool_name": _required_text(payload, "tool_name"),
+                        "tool_class": tool_class, "summary": locator,
+                        "input": payload.get("tool_input"),
+                    },
+                    occurred_at=occurred_at, tool_use_id=tool_use_id,
+                    agent_id=_optional_text(payload, "agent_id"),
+                    turn_id=_optional_text(payload, "turn_id"),
+                )
+                _record_trace(
+                    connection, repo, activity_session_id, "tool_result",
+                    {
+                        "succeeded": activity.tool_succeeded(
+                            harness, event, tool_class=tool_class,
+                            tool_response=payload.get("tool_response"),
+                        ),
+                        # Claude's failure event carries its error text at the top
+                        # level, not in a tool_response. Keep it, so a trace can quote it.
+                        "output": payload.get("tool_response") if payload.get("tool_response") is not None
+                        else ({"error": payload["error"]} if isinstance(payload.get("error"), str) else None),
+                    },
+                    occurred_at=occurred_at, tool_use_id=tool_use_id,
+                    agent_id=_optional_text(payload, "agent_id"),
+                    turn_id=_optional_text(payload, "turn_id"),
+                )
+                if _is_agent_call(harness, payload):
+                    _record_finished_agent_call(
+                        connection,
+                        repo,
+                        payload,
+                        harness,
+                        worktree_id,
+                        native_session_id,
+                        tool_use_id,
+                        capture,
+                    )
             connection.commit()
             if capture is None:
                 if not _takes_snapshot(harness, payload):
@@ -1774,7 +1853,16 @@ def _handle_metadata(
     with _worktree_lock(repo, blocking=True):
         connection = open_db(repo)
         try:
-            _session_context(
+            previous = (
+                connection.execute(
+                    "SELECT model FROM hook_sessions "
+                    "WHERE worktree_id = ? AND harness = ? AND native_session_id = ?",
+                    (worktree_id, harness, native_session_id),
+                ).fetchone()
+                if event == MODEL_EVENT
+                else None
+            )
+            model, _source, _feature, _feature_source = _session_context(
                 connection,
                 repo,
                 worktree_id,
@@ -1798,7 +1886,11 @@ def _handle_metadata(
                     _apply_retained_facets(
                         connection, existing, worktree_id, harness, native_session_id
                     )
-            elif event == "PostModelSwitch":
+            elif event == "PostModelSwitch" or (
+                # A harness that names its model at each request changed it
+                # only when the name differs from the one it named before.
+                previous is not None and previous["model"] not in {"unknown", model}
+            ):
                 _record_model_switch(
                     connection, worktree_id, harness, native_session_id, payload
                 )
@@ -1806,6 +1898,62 @@ def _handle_metadata(
         finally:
             connection.close()
     return _result("ignored")
+
+
+def _handle_usage(
+    repo: Path,
+    payload: Mapping[str, Any],
+    harness: str,
+    native_session_id: str,
+) -> dict[str, object]:
+    """Store the tokens, and any cost, that a harness reported for one request.
+
+    OpenCode reports each message's cost and tokens, and Hermes Agent reports
+    each provider request's tokens. The row joins the store that holds Claude
+    Code and Codex usage, so a report prices and allocates it the same way. A
+    request without a reported cost keeps its cost unknown.
+    """
+
+    from .telemetry import TelemetryStore
+    from .usage_fallback import UsageRow
+
+    request_id = _optional_text(payload, "request_id")
+    if request_id is None:
+        return _result("ignored")
+    native, _separator, agent = native_session_id.partition("::")
+
+    def count(field: str) -> int | None:
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    cost = payload.get("cost_usd")
+    priced = isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0
+    row = UsageRow(
+        event_key=str(
+            uuid.uuid5(uuid.NAMESPACE_URL, "\0".join(("hook-usage", harness, native, request_id)))
+        ),
+        provider=harness,
+        event_kind=f"{harness}_hook",
+        native_session_id=native,
+        agent_id=agent or None,
+        request_id=request_id,
+        model=_optional_text(payload, "model"),
+        input_tokens=count("input_tokens"),
+        cached_input_tokens=count("cached_input_tokens"),
+        cache_creation_input_tokens=count("cache_creation_input_tokens"),
+        output_tokens=count("output_tokens"),
+        total_tokens=count("total_tokens"),
+        observed_at_unix_nano=int(datetime.now(timezone.utc).timestamp() * 1_000_000_000),
+        cost_amount=str(cost) if priced else None,
+        cost_unit="USD" if priced else None,
+        cost_source=_optional_text(payload, "cost_source") if priced else None,
+    )
+    TelemetryStore().record_fallback_usage(
+        [row], repository_id=str(git_common_dir(repo)), repository_path=str(repo)
+    )
+    return _result("recorded")
 
 
 def _handle_subagent(
@@ -2185,7 +2333,8 @@ def _register_telemetry_session(
 ) -> None:
     """Make only this installed repository's native session eligible for OTel."""
 
-    if event not in {"SessionStart", "PreToolUse"}:
+    if event not in {"SessionStart", "PreToolUse"} or harness not in {"claude-code", "codex"}:
+        # Only Claude Code and Codex export cost telemetry to the collector.
         return
     try:
         state = read_install_state(repo)
@@ -2223,7 +2372,12 @@ def handle_hook(
     *,
     deadline: float | None = None,
 ) -> dict[str, object]:
-    """Handle one Codex or Claude Code JSON hook event without policy output.
+    """Handle one native JSON hook event without policy output.
+
+    Claude Code and Codex send the receiver's own events. Every other
+    supported harness sends its native events, which ``canonical_events``
+    translates first, so one native event can stand for several receiver
+    events.
 
     ``deadline`` is a ``hook_client.clock`` value after which the coding tool may
     already run. A ``PreToolUse`` that reads its baseline later records none.
@@ -2236,56 +2390,86 @@ def handle_hook(
         ):
             return _result("ignored")
         if harness not in SUPPORTED_HARNESSES:
-            raise ValueError("harness must be codex or claude-code")
+            raise ValueError(f"harness must be one of {', '.join(sorted(SUPPORTED_HARNESSES))}")
         if not isinstance(payload, Mapping):
             raise ValueError("Hook payload must be a JSON object")
+        events = canonical_events(harness, payload)
+        if not events:
+            return _result("ignored")
         root = repository_root(repo)
         enabled, gate_warning = _install_enabled(root)
         if not enabled and not _enrolled(root):
             # Machine-level hooks fire in every repository. One that never
             # enrolled writes nothing and takes no worktree snapshot.
             return _result("ignored")
-        if not _payload_repo_matches(root, payload):
+        if not all(_payload_repo_matches(root, event) for event in events):
             raise ValueError("Hook payload cwd belongs to a different Git worktree")
         if not enabled:
             enabled, gate_warning = _heal_worktree(root)
         if not enabled:
             return _result("ignored", warnings=[gate_warning] if gate_warning else [])
-        event = _required_text(payload, "hook_event_name")
-        if event not in KNOWN_EVENTS:
-            return _result("ignored")
-        try:
-            _register_telemetry_session(root, payload, harness, event)
-        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
-            # Cost telemetry is optional enrichment. It must never veto code
-            # capture, a tool call, or a Git operation.
-            pass
-        native_session_id = _effective_native_session(payload, event)
-        if event == "PreToolUse":
-            if not _takes_snapshot(harness, payload):
-                # A tool that changes no file needs no baseline. Its row is
-                # inserted when it completes, which costs no snapshot.
-                return _handle_fast_pre(root, payload, harness, native_session_id)
-            return _handle_pre(root, payload, harness, native_session_id, deadline)
-        if event in {"PostToolUse", "PostToolUseFailure"}:
-            return _handle_post(root, payload, harness, native_session_id, event)
-        if event in {"SessionStart", "PostModelSwitch"}:
-            return _handle_metadata(root, payload, harness, native_session_id, event)
-        if event in {"SubagentStart", "SubagentStop"}:
-            result = _handle_subagent(root, payload, harness, native_session_id, event)
-            _record_usage_fallback(root, payload, harness, event)
-            return result
-        if event in {"UserPromptSubmit", "Interrupt"}:
-            return _handle_turn(root, payload, harness, native_session_id, event)
-        if event in {"InstructionsLoaded", "PostCompact"}:
-            return _handle_context(root, payload, harness, native_session_id, event)
-        if event in {"Stop", "SessionEnd"}:
-            result = _handle_stop(root, payload, harness, native_session_id, event)
-            _record_usage_fallback(root, payload, harness, event)
-            return result
-        return _result("ignored")
     except Exception as exc:
         return _result("warning", warnings=[_warning(exc)])
+    results = []
+    for event in events:
+        try:
+            results.append(_handle_event(root, event, harness, deadline))
+        except Exception as exc:
+            results.append(_result("warning", warnings=[_warning(exc)]))
+    if len(results) == 1:
+        return results[0]
+    return _result(
+        next((item["status"] for item in reversed(results) if item["status"] != "ignored"), "ignored"),
+        session_id=next((item["session_id"] for item in reversed(results) if item["session_id"]), None),
+        changed_files=[path for item in results for path in item["changed_files"]],
+        recorded_commits=[commit for item in results for commit in item["recorded_commits"]],
+        warnings=[warning for item in results for warning in item["warnings"]],
+    )
+
+
+def _handle_event(
+    root: Path,
+    payload: Mapping[str, Any],
+    harness: str,
+    deadline: float | None,
+) -> dict[str, object]:
+    """Record one receiver event in an enrolled worktree."""
+
+    event = _required_text(payload, "hook_event_name")
+    if event not in KNOWN_EVENTS:
+        return _result("ignored")
+    try:
+        _register_telemetry_session(root, payload, harness, event)
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+        # Cost telemetry is optional enrichment. It must never veto code
+        # capture, a tool call, or a Git operation.
+        pass
+    native_session_id = _effective_native_session(payload, event)
+    if event == "PreToolUse":
+        if not _takes_snapshot(harness, payload):
+            # A tool that changes no file needs no baseline. Its row is
+            # inserted when it completes, which costs no snapshot.
+            return _handle_fast_pre(root, payload, harness, native_session_id)
+        return _handle_pre(root, payload, harness, native_session_id, deadline)
+    if event in {"PostToolUse", "PostToolUseFailure"}:
+        return _handle_post(root, payload, harness, native_session_id, event)
+    if event in {"SessionStart", "PostModelSwitch", MODEL_EVENT}:
+        return _handle_metadata(root, payload, harness, native_session_id, event)
+    if event == USAGE_EVENT:
+        return _handle_usage(root, payload, harness, native_session_id)
+    if event in {"SubagentStart", "SubagentStop"}:
+        result = _handle_subagent(root, payload, harness, native_session_id, event)
+        _record_usage_fallback(root, payload, harness, event)
+        return result
+    if event in {"UserPromptSubmit", "Interrupt"}:
+        return _handle_turn(root, payload, harness, native_session_id, event)
+    if event in {"InstructionsLoaded", "PostCompact"}:
+        return _handle_context(root, payload, harness, native_session_id, event)
+    if event in {"Stop", "SessionEnd"}:
+        result = _handle_stop(root, payload, harness, native_session_id, event)
+        _record_usage_fallback(root, payload, harness, event)
+        return result
+    return _result("ignored")
 
 
 def _record_usage_fallback(

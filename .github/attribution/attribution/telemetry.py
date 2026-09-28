@@ -691,13 +691,14 @@ class TelemetryStore:
         *,
         repository_id: str | os.PathLike[str],
         repository_path: str | os.PathLike[str] | None,
-        file_key: str,
-        cursor: Mapping[str, Any],
+        file_key: str | None = None,
+        cursor: Mapping[str, Any] | None = None,
     ) -> int:
         """Store usage-fallback rows and the read cursor in one transaction.
 
         A streamed copy of a request replaces the stored one only when it
         reports more output. Telemetry events are never replaced here.
+        Usage that a hook reported comes from no file, so it has no cursor.
         Returns the number of rows inserted or updated.
         """
 
@@ -707,7 +708,7 @@ class TelemetryStore:
         if repository is None:
             raise TelemetryError("repository_id must be a non-empty short string")
         path_text = _bounded_text(repository_path, 4096) if repository_path else None
-        state = cursor.get("state")
+        state = cursor.get("state") if cursor is not None else None
         state_text = (
             json.dumps(state, separators=(",", ":"), sort_keys=True)
             if isinstance(state, dict)
@@ -798,6 +799,8 @@ class TelemetryStore:
                         """,
                         (row.event_key, repository, path_text),
                     )
+            if file_key is None or cursor is None:
+                return changed
             connection.execute(
                 """
                 INSERT INTO usage_fallback_cursors (
@@ -1787,7 +1790,6 @@ def serve(
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
-        poller.stop()
         server.server_close()
 
 
