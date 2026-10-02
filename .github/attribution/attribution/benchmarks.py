@@ -42,10 +42,8 @@ TASK_BENCHMARKS: dict[str, tuple[str, ...]] = {
     "mechanical refactor": ("livebench-agentic-coding-2026-06-25", "terminal-bench-2.1-vals"),
     # Cognition's FrontierCode 1.1 judges whether a change would be merged; Cursor's CursorBench 4.0 traces its
     # tasks from committed code back to the agent request; Vals.ai's Vibe Code Bench builds an app and runs its
-    # tests; Scale's SWE-Bench Pro V2 dropped its invalid tasks.
-    "feature with tests": ("frontiercode-v1.1-main", "cursorbench-4.0", "vibe-code-bench-v1.1-vals",
-                           "swe-bench-pro-v2-public"),
-    # The same studies: they measure feature work whether or not the change adds tests.
+    # tests; Scale's SWE-Bench Pro V2 dropped its invalid tasks. They measure feature work whether or not the
+    # change adds tests.
     "feature": ("frontiercode-v1.1-main", "cursorbench-4.0", "vibe-code-bench-v1.1-vals", "swe-bench-pro-v2-public"),
     # Issues fixed and checked by tests: SWE-rebench's issues from after the models' data, Datacurve's DeepSWE,
     # OpenAI's DeepSWE runs, SWE-Bench Pro V2, then Terminal-Bench 2.1.

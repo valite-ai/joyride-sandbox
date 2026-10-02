@@ -7,7 +7,7 @@ The native paths stay local for usage enrichment by the history importer.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -16,7 +16,7 @@ import select
 import shutil
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .history_import import (
     MAX_FILE_BYTES, MAX_FILES, _BRANCH, _FAILED_TOOL_OUTPUT, _ID, _MODEL,
@@ -304,8 +304,15 @@ def _session(thread: dict[str, Any], repo: Path, roots: list[Path],
 
 
 def read_sessions(repo: Path, roots: list[Path], locations: list[Path],
-                  skipped: Counter[str]) -> list[tuple[dict[str, Any], list[Path]]] | None:
-    """Return official Codex metadata, or None for a safe native-log fallback."""
+                  skipped: Counter[str], *, since: date | None = None,
+                  tick: Callable[[], None] | None = None,
+                  ) -> list[tuple[dict[str, Any], list[Path]]] | None:
+    """Return official Codex metadata, or None for a safe native-log fallback.
+
+    A thread last updated before ``since`` is not read. ``tick`` is called for
+    each listed page and each thread read, so a caller can show that the
+    catalog moves.
+    """
 
     if not locations:
         return []
@@ -331,6 +338,8 @@ def read_sessions(repo: Path, roots: list[Path], locations: list[Path],
                 if cursor is not None:
                     params["cursor"] = cursor
                 page = server.request("thread/list", params)
+                if tick is not None:
+                    tick()
                 rows, next_cursor = page.get("data"), page.get("nextCursor")
                 if not isinstance(rows, list) or next_cursor is not None and not isinstance(next_cursor, str):
                     raise _Unavailable
@@ -355,12 +364,18 @@ def read_sessions(repo: Path, roots: list[Path], locations: list[Path],
                 continue
             if summary.get("ephemeral") is True:
                 continue
+            updated = _stamp(summary.get("updatedAt"))
+            if since is not None and updated is not None and updated[:10] < since.isoformat():
+                continue
             try:
                 response = server.request("thread/read", {"threadId": native, "includeTurns": True})
             except _Oversized:
                 # The native file of this one thread still supplies the session.
                 selected_skipped["oversized_session"] += 1
                 continue
+            finally:
+                if tick is not None:
+                    tick()
             thread = response.get("thread")
             if not isinstance(thread, dict) or thread.get("id") != native:
                 raise _Unavailable

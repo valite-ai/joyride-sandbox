@@ -9,6 +9,7 @@ URL is read locally and never uploaded.
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from decimal import Decimal
 from datetime import datetime, timezone
 import hashlib
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import time
 from typing import Any, Callable
@@ -105,6 +107,84 @@ def repository_roots(repo: Path, expected: str) -> list[Path]:
     return [root, *sorted(roots - {root})]
 
 
+def _recorded_roots(roots: list[Path], repository: str,
+                    codex_locations: list[Path]) -> tuple[list[Path], set[tuple[str, str]]]:
+    """Return removed worktree locations, and the sessions that local records tie to the repository.
+
+    Removing a worktree also removes Git's record of it, so its sessions
+    looked like those of another checkout. Joyride's capture registered each
+    session with its checkout's Git common directory, and Codex recorded the
+    origin URL of each session's checkout. Both records outlive the folder.
+    A removed folder can also have held a checkout of another repository, so
+    only the sessions that these records name are in scope through it.
+    """
+
+    from .telemetry import _state_dir_path
+
+    found: set[Path] = set()
+    tied: set[tuple[str, str]] = set()
+    common = _common_dir(roots[0])
+    database = _state_dir_path(None) / "telemetry.sqlite3"
+    if common is not None and database.is_file():
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            try:
+                rows = connection.execute(
+                    "SELECT provider, native_session_id, repository_path FROM registered_sessions "
+                    "WHERE repository_id=? AND repository_path IS NOT NULL", (str(common),),
+                ).fetchall()
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            rows = []
+        for provider, native, path in rows:
+            if isinstance(provider, str) and isinstance(native, str) and isinstance(path, str):
+                tied.add((provider, native))
+                found.add(Path(path))
+    for path in _files(codex_locations, Counter()):
+        try:
+            with path.open("rb") as source:
+                first = json.loads(source.readline(MAX_LINE_BYTES + 1))
+        except (OSError, ValueError, RecursionError):
+            continue
+        meta = first.get("payload") if isinstance(first, dict) and first.get("type") == "session_meta" else None
+        git = meta.get("git") if isinstance(meta, dict) else None
+        url = git.get("repository_url") if isinstance(git, dict) else None
+        identity = _remote_identity(url) if isinstance(url, str) else None
+        if identity is not None and "/".join(identity).lower() == repository.lower():
+            found.add(Path(str(meta.get("cwd"))))
+            if isinstance(meta.get("id"), str):
+                tied.add(("codex", meta["id"]))
+    recorded = set()
+    for path in found:
+        if not str(path).startswith("/") or "\x00" in str(path):
+            continue
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        # A folder that still exists is either a listed worktree or another checkout.
+        if not path.exists() and not any(path == root or root in path.parents for root in roots):
+            recorded.add(path)
+    return sorted(recorded), tied
+
+
+# While discover() runs, it keeps each directory's Git common directory here,
+# so a directory costs one Git call per import instead of one for every file.
+_common_dirs: dict[Path, Path | None] | None = None
+
+
+def _common_dir(path: Path) -> Path | None:
+    if _common_dirs is not None and path in _common_dirs:
+        return _common_dirs[path]
+    value = _git(path, "rev-parse", "--git-common-dir")
+    common = ((Path(value) if Path(value).is_absolute() else path / value).resolve()
+              if value else None)
+    if _common_dirs is not None:
+        _common_dirs[path] = common
+    return common
+
+
 def _in_repo(cwd: Any, roots: list[Path]) -> bool:
     if not isinstance(cwd, str) or not cwd.startswith("/") or "\x00" in cwd:
         return False
@@ -117,13 +197,10 @@ def _in_repo(cwd: Any, roots: list[Path]) -> bool:
         return False
     # An existing nested checkout can belong to a different repository.
     if path.exists():
-        target_common = _git(path, "rev-parse", "--git-common-dir")
-        root_common = _git(roots[0], "rev-parse", "--git-common-dir")
+        target_common = _common_dir(path)
+        root_common = _common_dir(roots[0])
         if target_common and root_common:
-            def absolute(base: Path, value: str) -> Path:
-                item = Path(value)
-                return (item if item.is_absolute() else base / item).resolve()
-            return absolute(path, target_common) == absolute(roots[0], root_common)
+            return target_common == root_common
     return True
 
 
@@ -309,6 +386,35 @@ def _files(roots: list[Path], skipped: Counter[str]):
                     skipped["oversized_file"] += 1
                     continue
                 yield path
+
+
+# A "cwd" member at any depth of a JSON line, as Claude Code and Codex write one.
+_CWD = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _names_checkout(path: Path, roots: list[Path]) -> bool:
+    """Say whether a file can hold a session of the checkout, without parsing its records.
+
+    ``_metadata`` scopes a session by the ``cwd`` of its records, so a file
+    whose ``cwd`` values all lie outside the roots holds none of its sessions.
+    A file that this check cannot read is left to ``_read``.
+    """
+
+    try:
+        with path.open("rb") as source:
+            data = source.read(MAX_FILE_BYTES + 1)
+    except OSError:
+        return True
+    if len(data) > MAX_FILE_BYTES:
+        return True
+    for value in set(_CWD.findall(data)):
+        try:
+            cwd = json.loads(b'"' + value + b'"')
+        except ValueError:
+            return True
+        if _in_repo(cwd, roots):
+            return True
+    return False
 
 
 def _read(path: Path, skipped: Counter[str]) -> tuple[list[dict[str, Any]], list[bytes], bool]:
@@ -559,7 +665,22 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
     ``files`` for each native file. A page can show a bar from these.
     """
 
-    roots = repository_roots(repo, repository)
+    global _common_dirs
+    _common_dirs = {}
+    try:
+        return _discover(repo, repository, since=since, claude_roots=claude_roots,
+                         codex_roots=codex_roots, progress=progress)
+    finally:
+        _common_dirs = None
+
+
+def _discover(repo: Path, repository: str, *, since: str | None,
+              claude_roots: list[Path] | None, codex_roots: list[Path] | None,
+              progress: Callable[[str, int, int], None] | None) -> dict[str, Any]:
+    live_roots = repository_roots(repo, repository)
+    default_claude, default_codex = _roots()
+    recorded, tied = _recorded_roots(live_roots, repository, default_codex if codex_roots is None else codex_roots)
+    roots = live_roots + recorded
     if since is not None:
         try:
             since_date = datetime.strptime(since, "%Y-%m-%d").date()
@@ -567,7 +688,6 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
             raise ValueError("--since must be a valid YYYY-MM-DD date") from exc
     else:
         since_date = None
-    default_claude, default_codex = _roots()
     skipped: Counter[str] = Counter()
     sessions: dict[tuple[str, str], dict[str, Any]] = {}
     usage_by_session: dict[tuple[str, str], dict[str, Any]] = {}
@@ -600,16 +720,33 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
                 progress("catalog", scanned, total_files)
             # The native pass reports skipped records once, including when a
             # provider validates a file and then falls back after an API error.
-            for metadata, paths in read_sessions(repo, roots, locations, Counter()) or []:
+            tick = (lambda: progress("catalog", scanned, total_files)) if progress else None
+            # A session of a removed worktree comes from the native pass, which checks its tie.
+            for metadata, paths in read_sessions(repo, live_roots, locations, Counter(), since=since_date,
+                                                 tick=tick) or []:
                 key = (provider, metadata["native_session_id"])
                 official[key] = metadata
                 official_paths[key] = {path.resolve() for path in paths}
         # Native records supply per-request usage that the public interfaces
         # omit. They also retain old sessions absent from provider catalogs.
+        selected_files = set().union(*official_paths.values())
         for path in _files(locations, skipped):
             scanned += 1
             if progress:
                 progress("files", scanned, total_files)
+            if path.resolve() not in selected_files:
+                # A file last written before the range holds no session inside it.
+                try:
+                    modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).date()
+                except (OSError, OverflowError, ValueError):
+                    modified = None
+                if since_date and modified and modified < since_date:
+                    skipped["before_since"] += 1
+                    continue
+                # Most files belong to other checkouts. Those are not parsed.
+                if not _names_checkout(path, roots):
+                    skipped["outside_repository"] += 1
+                    continue
             records, lines, partial = _read(path, skipped)
             if not records:
                 for key, selected_paths in official_paths.items():
@@ -663,6 +800,12 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
                     continue
                 if foreign:
                     skipped["mixed_repository"] += 1
+                    continue
+                # A removed folder can also have held another repository's checkout, so a
+                # session there needs a record of its own that ties it to this repository.
+                if (recorded and not selected_path and not {(provider, source_id), (provider, parent)} & tied
+                        and not _metadata(batch_records, provider, live_roots)[0]):
+                    skipped["outside_repository"] += 1
                     continue
                 session_files[key] += 1
                 builder = builders.get(key)
@@ -759,6 +902,9 @@ def discover(repo: Path, repository: str, *, since: str | None = None,
         session["created_commits"] = list(claims_by_sha.values())
     selected = []
     for key, session in sessions.items():
+        if progress:
+            # Pricing and traces take minutes on a large history. Each call shows that the scan moves.
+            progress("files", total_files, total_files)
         if session_files[key] > 1 or session.get("completeness") != "complete":
             # Copied, split, or partial transcripts can omit tool outcomes.
             # Keep their usage, but do not infer commits from one fragment.
@@ -872,13 +1018,16 @@ def upload(envelope: dict[str, Any], hosted_url: str, code: str) -> dict[str, in
 
 
 def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]],
-                on_request: Callable[[dict[str, Any], int, int], None] | None = None) -> dict[str, int]:
+                on_request: Callable[[dict[str, Any], int, int], None] | None = None,
+                *, workers: int = 1) -> dict[str, int]:
     """Send the envelope in bounded requests through ``post``.
 
     ``post`` sends one request body and returns the parsed answer. A temporary
     service error (HTTP 429, 500, 502, 503, or 504) or a network error is
     retried up to two times. ``on_request`` receives each answer with the
-    count of requests sent so far and the total.
+    count of requests answered so far and the total. Up to ``workers``
+    requests are in flight at once. The final request, which carries the
+    skipped counts, goes after all the others are answered.
 
     A session's trace and facts travel once, on its final fragment. A trace
     that cannot fit in one request goes as null, and the last request counts
@@ -954,19 +1103,14 @@ def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]
             claims = candidate_claims
     if chunk:
         chunks.append(chunk)
-    for index, batch in enumerate(chunks):
-        payload = {**envelope, "sessions": batch,
-                   "complete": index == len(chunks) - 1,
-                   "skipped": skipped if index == len(chunks) - 1 else []}
-        data = encoded(payload)
+
+    def send(index: int) -> dict[str, Any]:
+        final = index == len(chunks) - 1
+        data = encoded({**envelope, "sessions": chunks[index], "complete": final,
+                        "skipped": skipped if final else []})
         for attempt in range(3):
             try:
-                answer = post(data)
-                for name in ("accepted", "created", "updated", "skipped"):
-                    number = answer.get(name, 0)
-                    if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
-                        results[name] += number
-                break
+                return post(data)
             except HTTPError as exc:
                 if exc.code not in {429, 500, 502, 503, 504} or attempt == 2:
                     raise ValueError(f"hosted import returned HTTP {exc.code}") from None
@@ -974,7 +1118,36 @@ def upload_with(envelope: dict[str, Any], post: Callable[[bytes], dict[str, Any]
                 if attempt == 2:
                     raise ValueError("could not reach the hosted import") from None
             time.sleep(0.5 * (attempt + 1))
+
+    answered = 0
+
+    def received(answer: dict[str, Any]) -> None:
+        nonlocal answered
+        for name in ("accepted", "created", "updated", "skipped"):
+            number = answer.get(name, 0)
+            if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+                results[name] += number
+        answered += 1
         if on_request is not None:
-            on_request(answer, index + 1, len(chunks))
+            on_request(answer, answered, len(chunks))
+
+    waiting = iter(range(len(chunks) - 1))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        running: set[Future[dict[str, Any]]] = set()
+        try:
+            while True:
+                while len(running) < max(1, workers) and (index := next(waiting, None)) is not None:
+                    running.add(pool.submit(send, index))
+                if not running:
+                    break
+                done, running = wait(running, return_when=FIRST_COMPLETED)
+                for future in done:
+                    received(future.result())
+        except BaseException:
+            for future in running:
+                future.cancel()
+            raise
+    if chunks:
+        received(send(len(chunks) - 1))
     return {**results, "selected_sessions": len(sessions), "request_count": len(chunks),
             "traces_too_large": too_large}

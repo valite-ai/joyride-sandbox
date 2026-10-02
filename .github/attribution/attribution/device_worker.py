@@ -10,6 +10,7 @@ traces: a progress or error report never carries them, nor the token.
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import os
@@ -36,6 +37,14 @@ MAX_SCAN_LINES = 20
 _RETRY_ATTEMPTS = 3
 _RETRY_SECONDS = 2.0
 _SCAN_REPORT_SECONDS = 2.0
+# A job that makes no progress this long fails and its process ends, before
+# the service's 180-second lease runs out. The check runs this often.
+STALL_SECONDS = 150
+_WATCH_SECONDS = 5.0
+# Session uploads in flight at once, at most. The service checks access and
+# looks up commits for them at the same time, and stores them one at a time.
+# A claim names how many the service takes. An older service takes one.
+_UPLOAD_WORKERS = 3
 _MAX_JOB_BYTES = 64 * 1024
 _MESSAGES = {
     "checkout_not_found": "No checkout of this repository was found on this computer.",
@@ -45,6 +54,7 @@ _MESSAGES = {
     "rate_limited": "GitHub's rate limit was reached. Try again later.",
     "service_error": "The Joyride service returned an error.",
     "import_failed": "The import stopped with an error on this computer.",
+    "stalled": "The import stopped making progress on this computer.",
 }
 
 
@@ -79,11 +89,10 @@ def _registered_paths(state_dir: str | os.PathLike[str] | None) -> list[str]:
 
 
 def _transcript_cwds(path: Path) -> list[str]:
-    """Return the working directories named in the first lines of one transcript."""
+    """Return the first working directory named in the first lines of one transcript."""
 
     from .usage_fallback import MAX_LINE_BYTES
 
-    found: list[str] = []
     try:
         with path.open("rb") as source:
             for _ in range(MAX_SCAN_LINES):
@@ -101,10 +110,11 @@ def _transcript_cwds(path: Path) -> list[str]:
                 payload = record.get("payload")
                 for value in (record.get("cwd"), payload.get("cwd") if isinstance(payload, dict) else None):
                     if isinstance(value, str) and value.startswith("/") and "\x00" not in value:
-                        found.append(value)
+                        # One file is one session, so it counts once.
+                        return [value]
     except OSError:
-        return found
-    return found
+        return []
+    return []
 
 
 def _candidates(state_dir: str | os.PathLike[str] | None) -> Counter[str]:
@@ -124,6 +134,15 @@ def _candidates(state_dir: str | os.PathLike[str] | None) -> Counter[str]:
         for value in _transcript_cwds(path):
             hits[value] += 1
     return hits
+
+
+def _top(directory: Path) -> Path | None:
+    """Return the nearest folder at or above ``directory`` that holds a ``.git`` entry."""
+
+    for folder in (directory, *directory.parents):
+        if (folder / ".git").exists():
+            return folder
+    return None
 
 
 def _matching_root(directory: Path, full_name: str) -> Path | None:
@@ -147,8 +166,6 @@ def locate_checkout(
     and the root with the most hits wins. ``None`` means nothing matched.
     """
 
-    from .history_import import _git
-
     if isinstance(hint, str) and hint.startswith("/") and "\x00" not in hint:
         directory = Path(hint)
         if directory.is_dir():
@@ -156,17 +173,20 @@ def locate_checkout(
             if root is None:
                 raise CheckoutMismatch(_MESSAGES["checkout_mismatch"])
             return root
-    hits_by_top: Counter[str] = Counter()
+    # The folders that hold a .git entry group the candidates without a Git
+    # call each. Git then checks each folder once.
+    hits_by_top: Counter[Path] = Counter()
     for value, count in _candidates(state_dir).items():
         directory = Path(value)
         if not directory.is_dir():
             continue
-        top = _git(directory, "rev-parse", "--show-toplevel")
-        if top:
+        top = _top(directory)
+        if top is not None:
             hits_by_top[top] += count
     hits_by_root: Counter[Path] = Counter()
-    for top, count in hits_by_top.items():
-        root = _matching_root(Path(top), full_name)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        roots = pool.map(lambda top: _matching_root(top, full_name), hits_by_top)
+    for (top, count), root in zip(hits_by_top.items(), roots):
         if root is not None:
             hits_by_root[root] += count
     if not hits_by_root:
@@ -220,8 +240,14 @@ def run_job(
     # outlived its collector stops as soon as a later claim owns the job.
     attempt = job.get("attempt") if type(job.get("attempt")) is int and job.get("attempt") > 0 else None
     progress: dict[str, Any] = {}
+    last_tick = time.monotonic()
+
+    def tick() -> None:
+        nonlocal last_tick
+        last_tick = time.monotonic()
 
     def report(phase: str) -> None:
+        tick()
         answer = _retrying(lambda: client.progress(job_id, phase, progress, attempt))
         if answer.get("cancel_requested") is True:
             raise _Cancelled
@@ -239,6 +265,18 @@ def run_job(
     def fail(code: str) -> str:
         return finish("failed", code)
 
+    stopped = threading.Event()
+
+    def watch() -> None:
+        # A stuck step never reports again. Its job ends here instead of
+        # holding this computer for the child's hour.
+        while not stopped.wait(_WATCH_SECONDS):
+            if time.monotonic() - last_tick > STALL_SECONDS:
+                fail("stalled")
+                os._exit(1)
+                return
+
+    threading.Thread(target=watch, name="joyride-job-watch", daemon=True).start()
     try:
         report("locating")
         try:
@@ -261,15 +299,19 @@ def run_job(
                 break
         report("sessions")
         last_scan_report = 0.0
+        last_step = None
 
         def on_scan(step: str, done: int, total: int) -> None:
             # The page draws a bar from these. A report every two seconds
             # keeps the request count small on a large history.
-            nonlocal last_scan_report
+            nonlocal last_scan_report, last_step
+            tick()
+            # The last file goes out at once. The scan then keeps calling with that count.
+            last_file = step == "files" and done >= total and progress.get("files_scanned") != done
             progress.update({"scan_step": step, "files_scanned": done, "files_total": total})
             now = time.monotonic()
-            if step == "catalog" or done >= total or now - last_scan_report >= _SCAN_REPORT_SECONDS:
-                last_scan_report = now
+            if step != last_step or last_file or now - last_scan_report >= _SCAN_REPORT_SECONDS:
+                last_scan_report, last_step = now, step
                 report("sessions")
 
         envelope = discover(checkout, full_name, since=_since_date(job.get("since_at")), progress=on_scan)
@@ -282,7 +324,11 @@ def run_job(
                          "sessions_created": 0, "sessions_updated": 0})
         report("sessions")
         if envelope["sessions"]:
+            last_upload_report = time.monotonic()
+
             def on_request(answer: dict[str, Any], sent: int, total: int) -> None:
+                nonlocal last_upload_report
+                tick()
                 for name in ("accepted", "created", "updated"):
                     number = answer.get(name, 0)
                     if type(number) is int and number >= 0:
@@ -290,11 +336,14 @@ def run_job(
                         progress[key] = min(progress["sessions_found"], progress[key] + number)
                 if answer.get("cancel_requested") is True:
                     raise _Cancelled
-                if sent < total:
+                now = time.monotonic()
+                if sent < total and now - last_upload_report >= _SCAN_REPORT_SECONDS:
+                    last_upload_report = now
                     report("sessions")
 
+            offered = job.get("upload_workers")
             upload_with(envelope, lambda data: _retrying(lambda: client.upload_sessions(job_id, data)),
-                        on_request)
+                        on_request, workers=offered if type(offered) is int and 1 <= offered <= _UPLOAD_WORKERS else 1)
         progress["sessions_uploaded"] = progress["sessions_found"]
         return finish("complete")
     except _Cancelled:
@@ -318,6 +367,8 @@ def run_job(
         # A failure of any other kind ends the job now, so the page does not
         # wait for five expired leases to learn that the import stopped.
         return fail("import_failed")
+    finally:
+        stopped.set()
 
 
 class DevicePoller:

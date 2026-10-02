@@ -45,6 +45,8 @@ class MatchBudget:
 
     seconds_left: float = MAX_IMPORT_MATCH_SECONDS
     candidates_left: int = MAX_IMPORT_CANDIDATES
+    # The heads of the checkout's worktrees, read once for the whole import.
+    heads: list[str] | None = None
 
 
 @dataclass
@@ -370,16 +372,21 @@ def recorded_edit_commits(records: list[dict[str, Any]], provider: str, repo: Pa
             return []
         final = max(call.result_time or "" for call in calls)
         final_seconds = datetime.fromisoformat(final.replace("Z", "+00:00")).timestamp()
-        heads = ["HEAD"]
-        for root in roots:
-            if root == repo.resolve() or not root.is_dir():
-                continue
-            try:
-                head = _run(root, deadline, "rev-parse", "HEAD").decode("ascii").strip()
-            except (_NoProof, UnicodeError):
-                continue
-            if _SHA.fullmatch(head) and head not in heads:
-                heads.append(head)
+        heads = budget.heads
+        if heads is None:
+            heads = ["HEAD"]
+            for root in roots:
+                if root == repo.resolve() or not root.is_dir():
+                    continue
+                try:
+                    head = _run(root, deadline, "rev-parse", "HEAD").decode("ascii").strip()
+                except (_NoProof, UnicodeError):
+                    continue
+                if _SHA.fullmatch(head) and head not in heads:
+                    heads.append(head)
+            # A list that the deadline cut short is read again for the next session.
+            if time.monotonic() < deadline:
+                budget.heads = heads
         limit = min(MAX_CANDIDATES, budget.candidates_left)
         listing = _run(
             repo, deadline, "log", "--full-history", "--branches", "--remotes", *heads,

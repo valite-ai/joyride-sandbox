@@ -25,6 +25,9 @@ from .install_code import InstallCodeError, _NoRedirect, _origin
 
 _TOKEN = re.compile(r"^jrd_[A-Za-z0-9_-]{32}$")
 _TIMEOUT_SECONDS = 20
+# A session upload can run as long as the service's 60-second function limit.
+# A shorter wait sends the same upload again while the first copy still runs.
+_UPLOAD_TIMEOUT_SECONDS = 60
 _MAX_RESPONSE_BYTES = 65536
 
 
@@ -139,7 +142,7 @@ class DeviceClient:
         self._token = str(credential["token"])
         self._opener = build_opener(_NoRedirect())
 
-    def _post(self, path: str, body: dict[str, Any] | bytes) -> dict[str, Any]:
+    def _post(self, path: str, body: dict[str, Any] | bytes, timeout: float = _TIMEOUT_SECONDS) -> dict[str, Any]:
         data = body if isinstance(body, bytes) else json.dumps(body, separators=(",", ":")).encode("utf-8")
         request = Request(
             self.origin + path, data=data, method="POST",
@@ -149,7 +152,7 @@ class DeviceClient:
                      "User-Agent": f"joyride/{__version__}"},
         )
         try:
-            with self._opener.open(request, timeout=_TIMEOUT_SECONDS) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
             payload = _payload(exc.read(_MAX_RESPONSE_BYTES))
@@ -183,7 +186,7 @@ class DeviceClient:
         return self._post(f"/v1/devices/jobs/{int(job_id)}/pull-requests", {})
 
     def upload_sessions(self, job_id: int, data: bytes) -> dict[str, Any]:
-        return self._post(f"/v1/devices/jobs/{int(job_id)}/sessions", data)
+        return self._post(f"/v1/devices/jobs/{int(job_id)}/sessions", data, _UPLOAD_TIMEOUT_SECONDS)
 
     def progress(self, job_id: int, phase: str, progress: Mapping[str, Any],
                  attempt: int | None = None) -> dict[str, Any]:

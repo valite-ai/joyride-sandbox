@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _time(milliseconds: Any) -> str | None:
@@ -107,11 +107,15 @@ def _counts(messages: list[Any], session_id: str, *, subagent: bool = False
 
 
 def read_sessions(repo: Path, roots: list[Path], locations: list[Path],
-                  skipped: Counter[str]) -> list[tuple[dict[str, Any], list[Path]]] | None:
+                  skipped: Counter[str], *, since: date | None = None,
+                  tick: Callable[[], None] | None = None,
+                  ) -> list[tuple[dict[str, Any], list[Path]]] | None:
     """Return scoped SDK sessions and safe native files for raw usage enrichment.
 
     ``None`` means the SDK cannot read these configured local projects, so the
-    caller can use the legacy reader. Session text never enters the result.
+    caller can use the legacy reader. Session text never enters the result. A
+    session last written before ``since`` is not read. ``tick`` is called for
+    each listed session, so a caller can show that the catalog moves.
     """
     from .history_import import MAX_FILE_BYTES, MAX_FILES, _BRANCH, _ID, _in_repo, _metadata, _read
 
@@ -136,6 +140,8 @@ def read_sessions(repo: Path, roots: list[Path], locations: list[Path],
 
     result: list[tuple[dict[str, Any], list[Path]]] = []
     for info in listed:
+        if tick is not None:
+            tick()
         session_id = getattr(info, "session_id", None)
         cwd = getattr(info, "cwd", None)
         if not isinstance(session_id, str) or not _ID.fullmatch(session_id):
@@ -143,6 +149,9 @@ def read_sessions(repo: Path, roots: list[Path], locations: list[Path],
             continue
         if not _in_repo(cwd, roots):
             skipped["outside_repository"] += 1
+            continue
+        modified = _time(getattr(info, "last_modified", None))
+        if since is not None and modified is not None and modified[:10] < since.isoformat():
             continue
         paths = _native_paths(session_id, locations, skipped)
         if not paths:
